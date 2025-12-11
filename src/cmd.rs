@@ -381,6 +381,12 @@ pub enum Sub {
         /// Enable type inference for set types. This option is provided for backward compatibility.
         #[clap(long)]
         enable_set_inference: bool,
+
+        /// Percentage of table's WCU (Write Capacity Units) to use for import.{n}
+        /// Only effective when the table is in Provisioned mode.{n}
+        /// Valid values are 1-100. e.g. --wcu-percent 50 uses 50% of the table's WCU.
+        #[clap(long, value_parser = clap::value_parser!(u8).range(1..=100), verbatim_doc_comment)]
+        wcu_percent: Option<u8>,
     },
 
     /// Take backup of a DynamoDB table using on-demand backup

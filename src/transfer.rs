@@ -16,7 +16,7 @@
 
 use console::Term;
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     fs,
@@ -27,6 +27,7 @@ use std::{
 use dialoguer::Confirm;
 use log::{debug, error};
 use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
+use tokio::time::sleep;
 
 use aws_sdk_dynamodb::{
     operation::scan::ScanOutput,
@@ -36,6 +37,7 @@ use thiserror::Error;
 
 use super::app;
 use super::batch;
+use super::control;
 use super::data;
 use super::ddb::table;
 
@@ -131,6 +133,56 @@ impl ProgressState {
 }
 
 const MAX_NUMBER_OF_OBSERVES: usize = 10;
+
+/// Rate limiter for controlling write throughput based on WCU percentage.
+#[derive(Clone, Debug)]
+struct RateLimiter {
+    /// Target writes per second based on WCU and percentage
+    target_wps: f64,
+    /// Last batch write timestamp
+    last_write_time: Option<Instant>,
+    /// Number of items written in the last batch
+    last_batch_size: usize,
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter based on WCU and percentage.
+    /// Each WCU allows 1 write per second for items up to 1KB.
+    fn new(wcu: i64, percent: u8) -> Self {
+        let target_wps = (wcu as f64) * (percent as f64 / 100.0);
+        debug!(
+            "RateLimiter initialized: WCU={}, percent={}%, target_wps={:.2}",
+            wcu, percent, target_wps
+        );
+        RateLimiter {
+            target_wps,
+            last_write_time: None,
+            last_batch_size: 0,
+        }
+    }
+
+    /// Calculate delay needed before the next batch write to maintain the target rate.
+    async fn wait_if_needed(&mut self, batch_size: usize) {
+        if let Some(last_time) = self.last_write_time {
+            // Calculate the minimum time that should have elapsed for the last batch
+            let min_duration_secs = self.last_batch_size as f64 / self.target_wps;
+            let min_duration = Duration::from_secs_f64(min_duration_secs);
+            let elapsed = last_time.elapsed();
+
+            if elapsed < min_duration {
+                let sleep_duration = min_duration - elapsed;
+                debug!(
+                    "Rate limiting: sleeping for {:?} (min_duration={:?}, elapsed={:?})",
+                    sleep_duration, min_duration, elapsed
+                );
+                sleep(sleep_duration).await;
+            }
+        }
+
+        self.last_write_time = Some(Instant::now());
+        self.last_batch_size = batch_size;
+    }
+}
 
 /* =================================================
 Public functions
@@ -295,17 +347,50 @@ pub async fn import(
     input_file: String,
     format: Option<String>,
     enable_set_inference: bool,
+    wcu_percent: Option<u8>,
 ) -> Result<(), batch::DyneinBatchError> {
     let format_str: Option<&str> = format.as_deref();
 
     let ts: app::TableSchema = app::table_schema(cx).await;
-    if ts.mode == table::Mode::Provisioned {
-        let msg = "WARN: For the best performance on import/export, dynein recommends OnDemand mode. However the target table is Provisioned mode now. Proceed anyway?";
-        if !Confirm::new().with_prompt(msg).interact()? {
-            println!("Operation has been cancelled.");
-            return Ok(());
+
+    // Initialize rate limiter if wcu_percent is specified
+    let rate_limiter: Option<RateLimiter> = if let Some(percent) = wcu_percent {
+        if ts.mode == table::Mode::OnDemand {
+            println!("WARN: --wcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
+            None
+        } else {
+            // Get the table's WCU from DescribeTable API
+            let desc = control::describe_table_api(cx, ts.name.clone()).await;
+            let wcu = desc
+                .provisioned_throughput
+                .as_ref()
+                .and_then(|pt| pt.write_capacity_units)
+                .unwrap_or(0);
+
+            if wcu == 0 {
+                println!("WARN: Table WCU is 0. Rate limiting will be skipped.");
+                None
+            } else {
+                println!(
+                    "Rate limiting enabled: using {}% of {} WCU ({:.1} writes/sec)",
+                    percent,
+                    wcu,
+                    (wcu as f64) * (percent as f64 / 100.0)
+                );
+                Some(RateLimiter::new(wcu, percent))
+            }
         }
-    }
+    } else {
+        // No rate limiting, but still show warning for Provisioned mode
+        if ts.mode == table::Mode::Provisioned {
+            let msg = "WARN: For the best performance on import/export, dynein recommends OnDemand mode. However the target table is Provisioned mode now. Proceed anyway?";
+            if !Confirm::new().with_prompt(msg).interact()? {
+                println!("Operation has been cancelled.");
+                return Ok(());
+            }
+        }
+        None
+    };
 
     let input_string: String = if Path::new(&input_file).exists() {
         fs::read_to_string(&input_file)?
@@ -317,8 +402,13 @@ pub async fn import(
     match format_str {
         None | Some("json") | Some("json-compact") => {
             let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
-            write_array_of_jsons_with_chunked_25(cx, array_of_json_obj, enable_set_inference)
-                .await?;
+            write_array_of_jsons_with_chunked_25(
+                cx,
+                array_of_json_obj,
+                enable_set_inference,
+                rate_limiter.clone(),
+            )
+            .await?;
         }
         Some("jsonl") => {
             // JSON Lines can be deserialized with into_iter() as below.
@@ -327,8 +417,13 @@ pub async fn import(
             // list_of_jsons contains deserialize results. Filter them and get only valid items.
             let array_of_valid_json_obj: Vec<JsonValue> =
                 array_of_json_obj.filter_map(Result::ok).collect();
-            write_array_of_jsons_with_chunked_25(cx, array_of_valid_json_obj, enable_set_inference)
-                .await?;
+            write_array_of_jsons_with_chunked_25(
+                cx,
+                array_of_valid_json_obj,
+                enable_set_inference,
+                rate_limiter.clone(),
+            )
+            .await?;
         }
         Some("csv") => {
             let lines: Vec<&str> = input_string
@@ -341,11 +436,15 @@ pub async fn import(
             let mut matrix: Vec<Vec<&str>> = vec![];
             // Iterate over lines (from index = 1, as index = 0 is the header line)
             let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+            let mut rate_limiter_mut = rate_limiter;
             for (i, line) in lines.iter().enumerate().skip(1) {
                 let cells: Vec<&str> = line.split(',').collect::<Vec<&str>>();
                 debug!("splitted line => {:?}", cells);
                 matrix.push(cells);
                 if i % 25 == 0 {
+                    if let Some(ref mut rl) = rate_limiter_mut {
+                        rl.wait_if_needed(25).await;
+                    }
                     write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
                     progress_status.add_observation(25);
                     progress_status.show();
@@ -354,6 +453,9 @@ pub async fn import(
             }
             debug!("rest of matrix => {:?}", matrix);
             if !matrix.is_empty() {
+                if let Some(ref mut rl) = rate_limiter_mut {
+                    rl.wait_if_needed(matrix.len()).await;
+                }
                 write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
                 progress_status.add_observation(matrix.len());
                 progress_status.show();
@@ -545,11 +647,17 @@ async fn write_array_of_jsons_with_chunked_25(
     cx: &app::Context,
     array_of_json_obj: Vec<JsonValue>,
     enable_set_inference: bool,
+    rate_limiter: Option<RateLimiter>,
 ) -> Result<(), batch::DyneinBatchError> {
     let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+    let mut rate_limiter_mut = rate_limiter;
     for chunk /* Vec<JsonValue> */ in array_of_json_obj.chunks(25) { // As BatchWriteItem request can have up to 25 items.
         let items = chunk.to_vec();
         let count = items.len();
+        // Apply rate limiting before each batch write
+        if let Some(ref mut rl) = rate_limiter_mut {
+            rl.wait_if_needed(count).await;
+        }
         let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, items, enable_set_inference).await?;
         batch::batch_write_until_processed(cx, request_items).await?;
         progress_status.add_observation(count);
