@@ -358,6 +358,12 @@ pub enum Sub {
         /// [csv] Export only Primary Key(s). Effective only when --format is 'csv'.
         #[clap(long, conflicts_with("attributes"), verbatim_doc_comment)]
         keys_only: bool,
+
+        /// Percentage of table's RCU (Read Capacity Units) to use for export.{n}
+        /// Only effective when the table is in Provisioned mode.{n}
+        /// Valid values are 1-100. e.g. --rcu-percent 50 uses 50% of the table's RCU.
+        #[clap(long, value_parser = clap::value_parser!(u8).range(1..=100), verbatim_doc_comment)]
+        rcu_percent: Option<u8>,
     },
 
     /// Import items into a DynamoDB table from CSV/JSON file.

@@ -134,38 +134,39 @@ impl ProgressState {
 
 const MAX_NUMBER_OF_OBSERVES: usize = 10;
 
-/// Rate limiter for controlling write throughput based on WCU percentage.
+/// Rate limiter for controlling throughput based on capacity unit percentage.
+/// Can be used for both write (WCU) and read (RCU) operations.
 #[derive(Clone, Debug)]
 struct RateLimiter {
-    /// Target writes per second based on WCU and percentage
-    target_wps: f64,
-    /// Last batch write timestamp
-    last_write_time: Option<Instant>,
-    /// Number of items written in the last batch
+    /// Target operations per second based on capacity units and percentage
+    target_ops: f64,
+    /// Last operation timestamp
+    last_operation_time: Option<Instant>,
+    /// Number of items processed in the last batch
     last_batch_size: usize,
 }
 
 impl RateLimiter {
-    /// Create a new rate limiter based on WCU and percentage.
-    /// Each WCU allows 1 write per second for items up to 1KB.
-    fn new(wcu: i64, percent: u8) -> Self {
-        let target_wps = (wcu as f64) * (percent as f64 / 100.0);
+    /// Create a new rate limiter based on capacity units and percentage.
+    /// Each capacity unit allows 1 operation per second for items up to 1KB (WCU) or 4KB (RCU).
+    fn new(capacity_units: i64, percent: u8) -> Self {
+        let target_ops = (capacity_units as f64) * (percent as f64 / 100.0);
         debug!(
-            "RateLimiter initialized: WCU={}, percent={}%, target_wps={:.2}",
-            wcu, percent, target_wps
+            "RateLimiter initialized: CU={}, percent={}%, target_ops={:.2}",
+            capacity_units, percent, target_ops
         );
         RateLimiter {
-            target_wps,
-            last_write_time: None,
+            target_ops,
+            last_operation_time: None,
             last_batch_size: 0,
         }
     }
 
-    /// Calculate delay needed before the next batch write to maintain the target rate.
+    /// Calculate delay needed before the next batch operation to maintain the target rate.
     async fn wait_if_needed(&mut self, batch_size: usize) {
-        if let Some(last_time) = self.last_write_time {
+        if let Some(last_time) = self.last_operation_time {
             // Calculate the minimum time that should have elapsed for the last batch
-            let min_duration_secs = self.last_batch_size as f64 / self.target_wps;
+            let min_duration_secs = self.last_batch_size as f64 / self.target_ops;
             let min_duration = Duration::from_secs_f64(min_duration_secs);
             let elapsed = last_time.elapsed();
 
@@ -179,7 +180,7 @@ impl RateLimiter {
             }
         }
 
-        self.last_write_time = Some(Instant::now());
+        self.last_operation_time = Some(Instant::now());
         self.last_batch_size = batch_size;
     }
 }
@@ -197,18 +198,50 @@ pub async fn export(
     keys_only: bool,
     output_file: String,
     format: Option<String>,
+    rcu_percent: Option<u8>,
 ) -> Result<(), DyneinExportError> {
     // TODO: Parallel scan to make it faster https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan
     // TODO: Show rough progress bar (sum(scan_output.scanned_item)/item_size_of_the_table(6hr)) to track progress.
     let ts: app::TableSchema = app::table_schema(cx).await;
     let format_str: Option<&str> = format.as_deref();
 
-    if ts.mode == table::Mode::Provisioned {
-        let msg = "WARN: For the best performance on import/export, dynein recommends OnDemand mode. However the target table is Provisioned mode now. Proceed anyway?";
-        if !Confirm::new().with_prompt(msg).interact()? {
-            app::bye(0, "Operation has been cancelled.");
+    // Initialize rate limiter if rcu_percent is specified
+    let mut rate_limiter: Option<RateLimiter> = if let Some(percent) = rcu_percent {
+        if ts.mode == table::Mode::OnDemand {
+            println!("WARN: --rcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
+            None
+        } else {
+            // Get the table's RCU from DescribeTable API
+            let desc = control::describe_table_api(cx, ts.name.clone()).await;
+            let rcu = desc
+                .provisioned_throughput
+                .as_ref()
+                .and_then(|pt| pt.read_capacity_units)
+                .unwrap_or(0);
+
+            if rcu == 0 {
+                println!("WARN: Table RCU is 0. Rate limiting will be skipped.");
+                None
+            } else {
+                println!(
+                    "Rate limiting enabled: using {}% of {} RCU ({:.1} reads/sec)",
+                    percent,
+                    rcu,
+                    (rcu as f64) * (percent as f64 / 100.0)
+                );
+                Some(RateLimiter::new(rcu, percent))
+            }
         }
-    }
+    } else {
+        // No rate limiting, but still show warning for Provisioned mode
+        if ts.mode == table::Mode::Provisioned {
+            let msg = "WARN: For the best performance on import/export, dynein recommends OnDemand mode. However the target table is Provisioned mode now. Proceed anyway?";
+            if !Confirm::new().with_prompt(msg).interact()? {
+                app::bye(0, "Operation has been cancelled.");
+            }
+        }
+        None
+    };
 
     // Basically given_attributes would be used, but on CSV format, it can be overwritten by suggested attributes
     let attributes: Option<String> = match format_str {
@@ -261,6 +294,14 @@ pub async fn export(
     let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
     let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
     loop {
+        // Apply rate limiting before each scan
+        if let Some(ref mut rl) = rate_limiter {
+            // For scan operations, we estimate based on previous batch size
+            // On first iteration, use a default estimate of 100 items
+            let estimated_items = rl.last_batch_size.max(100);
+            rl.wait_if_needed(estimated_items).await;
+        }
+
         // Invoke Scan API here. At the 1st iteration exclusive_start_key would be "None" as defined above, outside of the loop.
         // On 2nd iteration and later, passing last_evaluated_key from the previous loop as an exclusive_start_key.
         let scan_output: ScanOutput = data::scan_api(

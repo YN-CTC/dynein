@@ -222,7 +222,8 @@ async fn dispatch(context: &mut app::Context, subcommand: cmd::Sub) -> Result<()
             keys_only,
             output_file,
             format,
-        } => transfer::export(context, attributes, keys_only, output_file, format).await?,
+            rcu_percent,
+        } => transfer::export(context, attributes, keys_only, output_file, format, rcu_percent).await?,
         cmd::Sub::Import {
             input_file,
             format,
