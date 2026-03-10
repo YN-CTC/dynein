@@ -278,6 +278,14 @@ impl Context {
         let sdk_region = Region::new(region_name.to_owned());
 
         let provider = RegionProviderChain::first_try(sdk_region);
+    async fn build_sdk_config(
+        &self,
+        region_name: &str,
+        retry_config: Option<RetryConfig>,
+    ) -> SdkConfig {
+        let sdk_region = Region::new(region_name.to_owned());
+
+        let provider = RegionProviderChain::first_try(sdk_region);
 
         // Configure timeout settings to handle high-throughput scenarios
         let timeout_config = TimeoutConfig::builder()
@@ -285,7 +293,7 @@ impl Context {
             .operation_timeout(Duration::from_secs(60)) // Set operation timeout to 60s
             .build();
 
-        let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        let mut config = aws_config::defaults(BehaviorVersion::latest())
             .region(provider)
             .timeout_config(timeout_config);
 
@@ -392,7 +400,7 @@ impl Context {
 
     pub fn should_strict_for_query(&self) -> bool {
         self.should_strict_for_query
-            .unwrap_or_else(|| self.config.as_ref().map_or(false, |c| c.query.strict_mode))
+            .unwrap_or_else(|| self.config.as_ref().is_some_and(|c| c.query.strict_mode))
     }
 
     pub async fn is_local(&self) -> bool {
