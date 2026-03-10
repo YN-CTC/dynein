@@ -17,7 +17,7 @@
 use crate::parser::DyneinParser;
 use aws_sdk_dynamodb::{
     operation::batch_write_item::BatchWriteItemError,
-    types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest},
+    types::{AttributeValue, DeleteRequest, PutRequest, ReturnConsumedCapacity, WriteRequest},
     Client as DynamoDbSdkClient,
 };
 use base64::{engine::general_purpose, Engine as _};
@@ -218,11 +218,12 @@ pub fn build_batch_request_items_from_json(
 /// > the failed operations are returned in the UnprocessedItems response parameter.
 /// > You can investigate and optionally resend the requests. Typically, you would call BatchWriteItem in a loop. Each iteration would
 /// > check for unprocessed items and submit a new BatchWriteItem request with those unprocessed items until all items have been processed.
+/// Returns (unprocessed_items, total_consumed_wcu).
 async fn batch_write_item_api(
     cx: &app::Context,
     request_items: HashMap<String, Vec<WriteRequest>>,
 ) -> Result<
-    Option<HashMap<String, Vec<WriteRequest>>>,
+    (Option<HashMap<String, Vec<WriteRequest>>>, f64),
     aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>,
 > {
     debug!(
@@ -242,31 +243,43 @@ async fn batch_write_item_api(
     match ddb
         .batch_write_item()
         .set_request_items(Some(request_items))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
         .send()
         .await
     {
-        Ok(res) => Ok(res.unprocessed_items),
+        Ok(res) => {
+            // Sum consumed WCU across all tables in this batch response.
+            let wcu: f64 = res
+                .consumed_capacity()
+                .iter()
+                .filter_map(|cc| cc.capacity_units())
+                .sum();
+            debug!("BatchWriteItem consumed {:.1} WCU this call", wcu);
+            Ok((res.unprocessed_items, wcu))
+        }
         Err(e) => Err(e),
     }
 }
 
-// Basically this function is intended to be defined as `pub async fn`.
-// However, to recursively use async function, you have to return a future wrapped by pinned box. For more details: `rustc --explain E0733`.
+/// Calls BatchWriteItem in a loop until all items are processed.
+/// Returns the total WCU consumed across all retries.
 pub async fn batch_write_until_processed(
     cx: &app::Context,
     mut request_items: HashMap<String, Vec<WriteRequest>>,
-) -> Result<(), aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>> {
+) -> Result<f64, aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>> {
+    let mut total_wcu = 0.0f64;
     loop {
-        request_items = match batch_write_item_api(cx, request_items).await {
-            Ok(result) => {
+        match batch_write_item_api(cx, request_items).await {
+            Ok((unprocessed, wcu)) => {
+                total_wcu += wcu;
                 let unprocessed_items: HashMap<String, Vec<WriteRequest>> =
-                    result.expect("alwasy wrapped by Some");
+                    unprocessed.expect("always wrapped by Some");
                 if !unprocessed_items.is_empty() {
                     // if there are any unprocessed items, retry rest items
                     debug!("UnprocessedItems: {:?}", &unprocessed_items);
-                    unprocessed_items
+                    request_items = unprocessed_items;
                 } else {
-                    return Ok(());
+                    return Ok(total_wcu);
                 }
             }
             Err(e) => return Err(e),
@@ -349,6 +362,7 @@ pub async fn batch_write_item(
     batch_write_item_api(cx, bwrite_items).await?;
     Ok(())
 }
+
 
 /// This function takes cx (just for table name) and Vec<JsonValue>, where this JsonValue consists of multiple items as a standard JSON format,
 ///   then returns a HashMap from table name to Vec<WriteRequest>.

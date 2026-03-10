@@ -26,7 +26,7 @@ use std::{
 use crate::parser::{AttributeDefinition, AttributeType, DyneinParser, ParseError};
 use aws_sdk_dynamodb::{
     operation::scan::ScanOutput,
-    types::{AttributeValue, ReturnValue},
+    types::{AttributeValue, ReturnConsumedCapacity, ReturnValue},
     Client as DynamoDbSdkClient,
 };
 use log::{debug, error};
@@ -186,6 +186,9 @@ pub async fn scan_api(
         .set_expression_attribute_names(scan_params.names)
         .consistent_read(consistent_read)
         .set_exclusive_start_key(esk)
+        // Always request consumed capacity so callers (e.g. export) can use it for
+        // accurate RCU-based rate limiting without extra API calls.
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
         .send()
         .await
         .unwrap_or_else(|e| {

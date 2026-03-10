@@ -138,12 +138,14 @@ const MAX_NUMBER_OF_OBSERVES: usize = 10;
 /// Can be used for both write (WCU) and read (RCU) operations.
 #[derive(Clone, Debug)]
 struct RateLimiter {
-    /// Target operations per second based on capacity units and percentage
+    /// Target operations (capacity units) per second
     target_ops: f64,
     /// Last operation timestamp
     last_operation_time: Option<Instant>,
-    /// Number of items processed in the last batch
+    /// Number of items processed in the last batch (used for import/purge)
     last_batch_size: usize,
+    /// Actual capacity units consumed by the last API call (RCU for export, WCU for import)
+    last_consumed_cu: f64,
 }
 
 impl RateLimiter {
@@ -159,10 +161,12 @@ impl RateLimiter {
             target_ops,
             last_operation_time: None,
             last_batch_size: 0,
+            last_consumed_cu: 0.0,
         }
     }
 
-    /// Calculate delay needed before the next batch operation to maintain the target rate.
+    /// Calculate delay needed before the next batch write/delete to maintain the target WCU rate.
+    /// Uses item count as a proxy for capacity unit consumption (1 item ≈ 1 WCU for ≤1 KB items).
     async fn wait_if_needed(&mut self, batch_size: usize) {
         if let Some(last_time) = self.last_operation_time {
             // Calculate the minimum time that should have elapsed for the last batch
@@ -182,6 +186,32 @@ impl RateLimiter {
 
         self.last_operation_time = Some(Instant::now());
         self.last_batch_size = batch_size;
+    }
+
+    /// Calculate delay needed before the next API call to maintain the target CU rate.
+    /// Uses the *actual* consumed capacity units returned by the previous API call,
+    /// which correctly accounts for item size (1 RCU = 4 KB, 1 WCU = 1 KB).
+    /// On the very first call `consumed_cu` should be 0.0, so no delay is applied.
+    async fn wait_based_on_cu(&mut self, consumed_cu: f64) {
+        if let Some(last_time) = self.last_operation_time {
+            if self.last_consumed_cu > 0.0 {
+                let min_duration_secs = self.last_consumed_cu / self.target_ops;
+                let min_duration = Duration::from_secs_f64(min_duration_secs);
+                let elapsed = last_time.elapsed();
+
+                if elapsed < min_duration {
+                    let sleep_duration = min_duration - elapsed;
+                    debug!(
+                        "Rate limiting: sleeping for {:?} (last_cu={:.1}, target_cu/s={:.1}, elapsed={:?})",
+                        sleep_duration, self.last_consumed_cu, self.target_ops, elapsed
+                    );
+                    sleep(sleep_duration).await;
+                }
+            }
+        }
+
+        self.last_operation_time = Some(Instant::now());
+        self.last_consumed_cu = consumed_cu;
     }
 }
 
@@ -293,13 +323,14 @@ pub async fn export(
 
     let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
     let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+    // Tracks the actual RCU consumed by the previous scan page, fed into the rate limiter
+    // before issuing the next scan. Starts at 0.0 so the very first scan is never delayed.
+    let mut last_actual_rcu: f64 = 0.0;
     loop {
-        // Apply rate limiting before each scan
+        // Apply RCU-accurate rate limiting based on actual capacity consumed in the previous scan.
+        // Unlike item-count heuristics, this correctly handles variable item sizes (1 RCU = 4 KB).
         if let Some(ref mut rl) = rate_limiter {
-            // For scan operations, we estimate based on previous batch size
-            // On first iteration, use a default estimate of 100 items
-            let estimated_items = rl.last_batch_size.max(100);
-            rl.wait_if_needed(estimated_items).await;
+            rl.wait_based_on_cu(last_actual_rcu).await;
         }
 
         // Invoke Scan API here. At the 1st iteration exclusive_start_key would be "None" as defined above, outside of the loop.
@@ -314,6 +345,15 @@ pub async fn export(
             last_evaluated_key, /* exclusive_start_key */
         )
         .await;
+
+        // Capture the actual RCU consumed by this scan page for the next iteration.
+        // scan_api always requests ReturnConsumedCapacity::Total, so this is always populated.
+        last_actual_rcu = scan_output
+            .consumed_capacity
+            .as_ref()
+            .and_then(|c| c.capacity_units)
+            .unwrap_or(0.0);
+        debug!("Scan consumed {:.1} RCU this page (actual)", last_actual_rcu);
 
         let items = scan_output
             .items
@@ -478,15 +518,18 @@ pub async fn import(
             // Iterate over lines (from index = 1, as index = 0 is the header line)
             let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
             let mut rate_limiter_mut = rate_limiter;
+            // WCU consumed by the previous BatchWriteItem call; 0.0 on the first batch (no delay).
+            let mut last_actual_wcu: f64 = 0.0;
             for (i, line) in lines.iter().enumerate().skip(1) {
                 let cells: Vec<&str> = line.split(',').collect::<Vec<&str>>();
                 debug!("splitted line => {:?}", cells);
                 matrix.push(cells);
                 if i % 25 == 0 {
                     if let Some(ref mut rl) = rate_limiter_mut {
-                        rl.wait_if_needed(25).await;
+                        rl.wait_based_on_cu(last_actual_wcu).await;
                     }
-                    write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
+                    last_actual_wcu =
+                        write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
                     progress_status.add_observation(25);
                     progress_status.show();
                     matrix.clear();
@@ -495,7 +538,7 @@ pub async fn import(
             debug!("rest of matrix => {:?}", matrix);
             if !matrix.is_empty() {
                 if let Some(ref mut rl) = rate_limiter_mut {
-                    rl.wait_if_needed(matrix.len()).await;
+                    rl.wait_based_on_cu(last_actual_wcu).await;
                 }
                 write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
                 progress_status.add_observation(matrix.len());
@@ -692,15 +735,18 @@ async fn write_array_of_jsons_with_chunked_25(
 ) -> Result<(), batch::DyneinBatchError> {
     let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
     let mut rate_limiter_mut = rate_limiter;
+    // WCU consumed by the previous BatchWriteItem call; 0.0 on the first iteration (no delay).
+    let mut last_actual_wcu: f64 = 0.0;
     for chunk /* Vec<JsonValue> */ in array_of_json_obj.chunks(25) { // As BatchWriteItem request can have up to 25 items.
         let items = chunk.to_vec();
         let count = items.len();
-        // Apply rate limiting before each batch write
+        // Apply rate limiting based on actual WCU consumed by the previous batch.
         if let Some(ref mut rl) = rate_limiter_mut {
-            rl.wait_if_needed(count).await;
+            rl.wait_based_on_cu(last_actual_wcu).await;
         }
         let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, items, enable_set_inference).await?;
-        batch::batch_write_until_processed(cx, request_items).await?;
+        last_actual_wcu = batch::batch_write_until_processed(cx, request_items).await?;
+        debug!("BatchWriteItem consumed {:.1} WCU this batch (actual)", last_actual_wcu);
         progress_status.add_observation(count);
         progress_status.show();
     }
@@ -715,16 +761,18 @@ async fn write_array_of_jsons_with_chunked_25(
 /// [[John, 12, Apple],
 ///  [Ami, 23, Orange],
 ///  [Shu, 42, Banana]] ... matrix
+/// Writes a CSV matrix chunk via BatchWriteItem and returns the actual WCU consumed.
 async fn write_csv_matrix(
     cx: &app::Context,
     matrix: &[Vec<&str>],
     headers: &[&str],
     enable_set_inference: bool,
-) -> Result<(), batch::DyneinBatchError> {
+) -> Result<f64, batch::DyneinBatchError> {
     let request_items: HashMap<String, Vec<WriteRequest>> =
         batch::csv_matrix_to_request_items(cx, matrix, headers, enable_set_inference).await?;
-    batch::batch_write_until_processed(cx, request_items).await?;
-    Ok(())
+    let consumed_wcu = batch::batch_write_until_processed(cx, request_items).await?;
+    debug!("BatchWriteItem consumed {:.1} WCU this CSV batch (actual)", consumed_wcu);
+    Ok(consumed_wcu)
 }
 
 #[cfg(test)]
@@ -732,6 +780,113 @@ mod tests {
     use super::*;
     use std::ops::Add;
     use std::time::Duration;
+
+    // --- RateLimiter ---
+
+    #[test]
+    fn test_rate_limiter_initialization() {
+        let rl = RateLimiter::new(1000, 50);
+        assert_eq!(rl.target_ops, 500.0);
+        assert!(rl.last_operation_time.is_none());
+        assert_eq!(rl.last_batch_size, 0);
+        assert_eq!(rl.last_consumed_cu, 0.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_full_percentage() {
+        let rl = RateLimiter::new(500, 100);
+        assert_eq!(rl.target_ops, 500.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_half_percentage() {
+        let rl = RateLimiter::new(10000, 50);
+        assert_eq!(rl.target_ops, 5000.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_percentage() {
+        let rl = RateLimiter::new(10000, 0);
+        assert_eq!(rl.target_ops, 0.0);
+    }
+
+    /// Verify that the first call to `wait_if_needed` does not block and correctly
+    /// updates internal state (last_operation_time and last_batch_size).
+    #[tokio::test]
+    async fn test_rate_limiter_first_call_updates_state() {
+        let mut rl = RateLimiter::new(1000, 100);
+        assert!(rl.last_operation_time.is_none());
+        assert_eq!(rl.last_batch_size, 0);
+
+        // First call should not sleep because last_operation_time is None.
+        rl.wait_if_needed(25).await;
+
+        assert!(rl.last_operation_time.is_some());
+        assert_eq!(rl.last_batch_size, 25);
+    }
+
+    /// Verify that each call to `wait_if_needed` updates last_batch_size.
+    #[tokio::test]
+    async fn test_rate_limiter_batch_size_updated_each_call() {
+        let mut rl = RateLimiter::new(1000, 100);
+
+        rl.wait_if_needed(10).await;
+        assert_eq!(rl.last_batch_size, 10);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        rl.wait_if_needed(25).await;
+        assert_eq!(rl.last_batch_size, 25);
+    }
+
+    /// Verify that a low WCU rate causes a measurable delay.
+    #[tokio::test]
+    async fn test_rate_limiter_imposes_delay() {
+        // target_ops = 10 WCU * 100% = 10 items/sec → min_duration for 5 items = 0.5s
+        let mut rl = RateLimiter::new(10, 100);
+        rl.wait_if_needed(5).await; // first call: no delay
+        let before = Instant::now();
+        rl.wait_if_needed(1).await; // second call: should sleep ~0.5s - elapsed
+        let elapsed = before.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "Expected delay >=400ms, got {:?}",
+            elapsed
+        );
+    }
+
+    /// Verify that wait_based_on_cu updates last_consumed_cu correctly (first call = no delay).
+    #[tokio::test]
+    async fn test_rate_limiter_rcu_first_call_no_delay() {
+        let mut rl = RateLimiter::new(3000, 90); // target = 2700 CU/sec
+        assert!(rl.last_operation_time.is_none());
+        assert_eq!(rl.last_consumed_cu, 0.0);
+
+        // First call: last_consumed_cu == 0 so no delay, but stores the value.
+        rl.wait_based_on_cu(256.0).await;
+
+        assert!(rl.last_operation_time.is_some());
+        assert_eq!(rl.last_consumed_cu, 256.0);
+    }
+
+    /// Verify that wait_based_on_cu imposes a delay based on actual consumed CU (RCU/WCU).
+    #[tokio::test]
+    async fn test_rate_limiter_rcu_imposes_delay() {
+        // target = 10 CU/sec; last call consumed 5 CU → min_duration = 0.5s
+        let mut rl = RateLimiter::new(10, 100); // target_ops = 10
+        rl.wait_based_on_cu(5.0).await; // first call: no delay, stores 5.0 CU
+        let before = Instant::now();
+        rl.wait_based_on_cu(1.0).await; // second call: should sleep ~0.5s - elapsed
+        let elapsed = before.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "Expected CU-based delay >=400ms, got {:?}",
+            elapsed
+        );
+    }
+
+    // --- ProgressState ---
 
     #[test]
     fn test_progress_status() {
