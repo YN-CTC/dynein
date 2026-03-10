@@ -1085,9 +1085,8 @@ pub fn convert_items_to_csv_lines(
 ) -> String {
     items
         .iter()
-        .map(|item| convert_item_to_csv_line(item, ts, attributes_to_append, keys_only))
-        .collect::<Vec<String>>()
-        .join("\n")
+        .map(|item| convert_item_to_csv_line(item, ts, attributes_to_append, keys_only) + "\n")
+        .collect::<String>()
 }
 
 /// This function convert from a DynamoDB item: { "abc": "val", "def": 123 }

@@ -451,14 +451,15 @@ pub async fn export(
         None | Some("json") => json_finish(f, tmp_output_filename)?.write_all(b"\n]")?,
         Some("json-compact") => json_finish(f, tmp_output_filename)?.write_all(b"]")?,
         Some("jsonl") => jsonl_finish(f, tmp_output_filename)?,
-        Some("csv") => csv_finish(
-            f,
-            tmp_output_filename,
-            &ts,
-            attrs_to_append(&ts, &attributes),
-            keys_only,
-        )?
-        .write_all(b"\n")?,
+        Some("csv") => {
+            csv_finish(
+                f,
+                tmp_output_filename,
+                &ts,
+                attrs_to_append(&ts, &attributes),
+                keys_only,
+            )?;
+        }
         Some(o) => panic!("Invalid output format is given: {}", o),
     };
 
