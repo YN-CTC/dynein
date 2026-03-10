@@ -230,6 +230,12 @@ async fn dispatch(context: &mut app::Context, subcommand: cmd::Sub) -> Result<()
             enable_set_inference,
             wcu_percent,
         } => transfer::import(context, input_file, format, enable_set_inference, wcu_percent).await?,
+        cmd::Sub::Purge {
+            input_file,
+            format,
+            wcu_percent,
+            yes,
+        } => transfer::purge(context, input_file, format, wcu_percent, yes).await?,
         cmd::Sub::Backup { list, all_tables } => {
             if list {
                 control::list_backups(context, all_tables).await?

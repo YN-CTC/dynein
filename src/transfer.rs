@@ -32,6 +32,7 @@ use tokio::time::sleep;
 use aws_sdk_dynamodb::{
     operation::scan::ScanOutput,
     types::{AttributeValue, WriteRequest},
+    Client as DynamoDbSdkClient,
 };
 use thiserror::Error;
 
@@ -475,6 +476,10 @@ pub async fn import(
                 .collect::<Vec<&str>>(); // remove blank line (e.g. last line)
             let headers: Vec<&str> = lines[0].split(',').collect::<Vec<&str>>();
             let mut matrix: Vec<Vec<&str>> = vec![];
+            // Create a single client instance to reuse TCP connections across all batch writes.
+            // This avoids ephemeral port exhaustion caused by TIME_WAIT accumulation when a new
+            // client (and thus a new TCP connection) is created for every request.
+            let client = batch::create_batch_client(cx).await;
             // Iterate over lines (from index = 1, as index = 0 is the header line)
             let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
             let mut rate_limiter_mut = rate_limiter;
@@ -486,7 +491,7 @@ pub async fn import(
                     if let Some(ref mut rl) = rate_limiter_mut {
                         rl.wait_if_needed(25).await;
                     }
-                    write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
+                    write_csv_matrix(cx, &client, &matrix, &headers, enable_set_inference).await?;
                     progress_status.add_observation(25);
                     progress_status.show();
                     matrix.clear();
@@ -497,13 +502,127 @@ pub async fn import(
                 if let Some(ref mut rl) = rate_limiter_mut {
                     rl.wait_if_needed(matrix.len()).await;
                 }
-                write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
+                write_csv_matrix(cx, &client, &matrix, &headers, enable_set_inference).await?;
                 progress_status.add_observation(matrix.len());
                 progress_status.show();
             }
         }
         Some(o) => panic!("Invalid input format is given: {}", o),
     }
+    Ok(())
+}
+
+/// Delete items in bulk from a DynamoDB table using a file exported by `dy export`.
+/// For each item in the file only the primary key(s) are extracted; other attributes are ignored.
+/// Uses BatchWriteItem with DeleteRequest and reuses a single TCP connection for performance.
+pub async fn purge(
+    cx: &app::Context,
+    input_file: String,
+    format: Option<String>,
+    wcu_percent: Option<u8>,
+    yes: bool,
+) -> Result<(), batch::DyneinBatchError> {
+    let format_str: Option<&str> = format.as_deref();
+    let ts: app::TableSchema = app::table_schema(cx).await;
+
+    // Confirm before deleting unless --yes is specified
+    if !yes {
+        let msg = format!(
+            "This will DELETE items from table '{}'. Are you sure?",
+            ts.name
+        );
+        if !Confirm::new().with_prompt(msg).interact()? {
+            println!("Operation has been cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Initialize rate limiter if wcu_percent is specified
+    let rate_limiter: Option<RateLimiter> = if let Some(percent) = wcu_percent {
+        if ts.mode == table::Mode::OnDemand {
+            println!("WARN: --wcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
+            None
+        } else {
+            let desc = control::describe_table_api(cx, ts.name.clone()).await;
+            let wcu = desc
+                .provisioned_throughput
+                .as_ref()
+                .and_then(|pt| pt.write_capacity_units)
+                .unwrap_or(0);
+
+            if wcu == 0 {
+                println!("WARN: Table WCU is 0. Rate limiting will be skipped.");
+                None
+            } else {
+                println!(
+                    "Rate limiting enabled: using {}% of {} WCU ({:.1} writes/sec)",
+                    percent,
+                    wcu,
+                    (wcu as f64) * (percent as f64 / 100.0)
+                );
+                Some(RateLimiter::new(wcu, percent))
+            }
+        }
+    } else {
+        None
+    };
+
+    let input_string: String = if Path::new(&input_file).exists() {
+        fs::read_to_string(&input_file)?
+    } else {
+        error!("Couldn't find the input file '{}'.", &input_file);
+        std::process::exit(1);
+    };
+
+    match format_str {
+        None | Some("json") | Some("json-compact") => {
+            let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
+            delete_jsonvals_with_chunked_25(cx, array_of_json_obj, &ts, rate_limiter).await?;
+        }
+        Some("jsonl") => {
+            let array_of_json_obj: StreamDeserializer<'_, StrRead<'_>, JsonValue> =
+                Deserializer::from_str(&input_string).into_iter::<JsonValue>();
+            let array_of_valid_json_obj: Vec<JsonValue> =
+                array_of_json_obj.filter_map(Result::ok).collect();
+            delete_jsonvals_with_chunked_25(cx, array_of_valid_json_obj, &ts, rate_limiter).await?;
+        }
+        Some("csv") => {
+            let lines: Vec<&str> = input_string
+                .split('\n')
+                .collect::<Vec<&str>>()
+                .into_iter()
+                .filter(|&x| !x.is_empty())
+                .collect::<Vec<&str>>();
+            let headers: Vec<&str> = lines[0].split(',').collect::<Vec<&str>>();
+            let mut matrix: Vec<Vec<&str>> = vec![];
+            let client = batch::create_batch_client(cx).await;
+            let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+            let mut rate_limiter_mut = rate_limiter;
+            for (i, line) in lines.iter().enumerate().skip(1) {
+                let cells: Vec<&str> = line.split(',').collect::<Vec<&str>>();
+                matrix.push(cells);
+                if i % 25 == 0 {
+                    if let Some(ref mut rl) = rate_limiter_mut {
+                        rl.wait_if_needed(25).await;
+                    }
+                    delete_csv_matrix(cx, &client, &matrix, &headers, &ts).await?;
+                    progress_status.add_observation(25);
+                    progress_status.show();
+                    matrix.clear();
+                }
+            }
+            if !matrix.is_empty() {
+                if let Some(ref mut rl) = rate_limiter_mut {
+                    rl.wait_if_needed(matrix.len()).await;
+                }
+                delete_csv_matrix(cx, &client, &matrix, &headers, &ts).await?;
+                progress_status.add_observation(matrix.len());
+                progress_status.show();
+            }
+        }
+        Some(o) => panic!("Invalid input format is given: {}", o),
+    }
+
     Ok(())
 }
 
@@ -692,6 +811,10 @@ async fn write_array_of_jsons_with_chunked_25(
 ) -> Result<(), batch::DyneinBatchError> {
     let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
     let mut rate_limiter_mut = rate_limiter;
+    // Create a single client instance to reuse TCP connections across all batch writes.
+    // This avoids ephemeral port exhaustion caused by TIME_WAIT accumulation when a new
+    // client (and thus a new TCP connection) is created for every request.
+    let client = batch::create_batch_client(cx).await;
     for chunk /* Vec<JsonValue> */ in array_of_json_obj.chunks(25) { // As BatchWriteItem request can have up to 25 items.
         let items = chunk.to_vec();
         let count = items.len();
@@ -700,7 +823,7 @@ async fn write_array_of_jsons_with_chunked_25(
             rl.wait_if_needed(count).await;
         }
         let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, items, enable_set_inference).await?;
-        batch::batch_write_until_processed(cx, request_items).await?;
+        batch::batch_write_until_processed_with_client(&client, request_items).await?;
         progress_status.add_observation(count);
         progress_status.show();
     }
@@ -709,6 +832,7 @@ async fn write_array_of_jsons_with_chunked_25(
 
 /// This function takes "matrix" with "headers", builds a parameter for BatchWriteItem, then write it untill they've been processed all.
 /// The "matrix" is a data built from CSV file and each "cell/column" is an attribute of a item.
+/// Accepts a pre-built `client` to reuse TCP connections across repeated calls.
 ///
 /// e.g.
 ///    name, age, fruit ... headers
@@ -717,13 +841,57 @@ async fn write_array_of_jsons_with_chunked_25(
 ///  [Shu, 42, Banana]] ... matrix
 async fn write_csv_matrix(
     cx: &app::Context,
+    client: &DynamoDbSdkClient,
     matrix: &[Vec<&str>],
     headers: &[&str],
     enable_set_inference: bool,
 ) -> Result<(), batch::DyneinBatchError> {
     let request_items: HashMap<String, Vec<WriteRequest>> =
         batch::csv_matrix_to_request_items(cx, matrix, headers, enable_set_inference).await?;
-    batch::batch_write_until_processed(cx, request_items).await?;
+    batch::batch_write_until_processed_with_client(client, request_items).await?;
+    Ok(())
+}
+
+/// Processes JSON/JSONL items in chunks of 25, issuing BatchWriteItem DeleteRequests.
+/// Extracts only PK/SK from each item; all other attributes are ignored.
+/// Reuses a single client for all requests to avoid TCP port exhaustion.
+async fn delete_jsonvals_with_chunked_25(
+    cx: &app::Context,
+    array_of_json_obj: Vec<JsonValue>,
+    ts: &app::TableSchema,
+    rate_limiter: Option<RateLimiter>,
+) -> Result<(), batch::DyneinBatchError> {
+    let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+    let mut rate_limiter_mut = rate_limiter;
+    let client = batch::create_batch_client(cx).await;
+    for chunk in array_of_json_obj.chunks(25) {
+        let items = chunk.to_vec();
+        let count = items.len();
+        if let Some(ref mut rl) = rate_limiter_mut {
+            rl.wait_if_needed(count).await;
+        }
+        let request_items =
+            batch::convert_jsonvals_to_delete_request_items(cx, items, ts).await?;
+        batch::batch_write_until_processed_with_client(&client, request_items).await?;
+        progress_status.add_observation(count);
+        progress_status.show();
+    }
+    Ok(())
+}
+
+/// Issues BatchWriteItem DeleteRequests for a CSV matrix chunk.
+/// Only PK/SK columns are used; other columns are ignored.
+/// Accepts a pre-built `client` to reuse TCP connections across repeated calls.
+async fn delete_csv_matrix(
+    cx: &app::Context,
+    client: &DynamoDbSdkClient,
+    matrix: &[Vec<&str>],
+    headers: &[&str],
+    ts: &app::TableSchema,
+) -> Result<(), batch::DyneinBatchError> {
+    let request_items =
+        batch::csv_matrix_to_delete_request_items(cx, matrix, headers, ts).await?;
+    batch::batch_write_until_processed_with_client(client, request_items).await?;
     Ok(())
 }
 
@@ -732,6 +900,90 @@ mod tests {
     use super::*;
     use std::ops::Add;
     use std::time::Duration;
+
+    // --- RateLimiter ---
+
+    #[test]
+    fn test_rate_limiter_initialization() {
+        let rl = RateLimiter::new(1000, 50);
+        assert_eq!(rl.target_ops, 500.0);
+        assert!(rl.last_operation_time.is_none());
+        assert_eq!(rl.last_batch_size, 0);
+    }
+
+    #[test]
+    fn test_rate_limiter_full_percentage() {
+        let rl = RateLimiter::new(500, 100);
+        assert_eq!(rl.target_ops, 500.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_half_percentage() {
+        let rl = RateLimiter::new(10000, 50);
+        assert_eq!(rl.target_ops, 5000.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_percentage() {
+        let rl = RateLimiter::new(10000, 0);
+        assert_eq!(rl.target_ops, 0.0);
+    }
+
+    /// Verify that the first call to `wait_if_needed` does not block and correctly
+    /// updates internal state (last_operation_time and last_batch_size).
+    #[tokio::test]
+    async fn test_rate_limiter_first_call_updates_state() {
+        let mut rl = RateLimiter::new(1000, 100);
+        assert!(rl.last_operation_time.is_none());
+        assert_eq!(rl.last_batch_size, 0);
+
+        // First call should not sleep because last_operation_time is None.
+        rl.wait_if_needed(25).await;
+
+        assert!(rl.last_operation_time.is_some());
+        assert_eq!(rl.last_batch_size, 25);
+    }
+
+    /// Verify that each call to `wait_if_needed` updates last_batch_size to the
+    /// new batch size, so the next call uses it for delay calculation.
+    #[tokio::test]
+    async fn test_rate_limiter_batch_size_updated_each_call() {
+        let mut rl = RateLimiter::new(1000, 100);
+
+        rl.wait_if_needed(10).await;
+        assert_eq!(rl.last_batch_size, 10);
+
+        // Sleep long enough to avoid being throttled, then call with a different size.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        rl.wait_if_needed(25).await;
+        assert_eq!(rl.last_batch_size, 25);
+    }
+
+    /// Verify that a slow WCU rate causes a measurable delay between calls.
+    /// We set WCU=1 (1 item/sec). Writing a batch of 1 item should require ~1s
+    /// before the next batch is allowed. Here we use a very small target to make
+    /// the test fast: 10 WCU at 10% = 1 write/sec.
+    #[tokio::test]
+    async fn test_rate_limiter_imposes_delay() {
+        // target_wps = 100 WCU * 10% = 10 items/sec
+        // Writing 10 items means minimum elapsed = 10 / 10 = 1.0s before next call.
+        // To keep the test fast we use a tighter scenario:
+        //   10 WCU * 100% = 10 items/sec => min_duration for 5 items = 0.5s
+        let mut rl = RateLimiter::new(10, 100); // target_wps = 10
+        rl.wait_if_needed(5).await; // first call: no delay, just records time
+        let before = Instant::now();
+        rl.wait_if_needed(1).await; // second call: should sleep ~(5/10 - elapsed) seconds
+        let elapsed = before.elapsed();
+
+        // We expect a delay of roughly 0.5s (5 items / 10 wps). Allow a 200ms margin.
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "Expected delay >=400ms, got {:?}",
+            elapsed
+        );
+    }
+
+    // --- ProgressState ---
 
     #[test]
     fn test_progress_status() {
