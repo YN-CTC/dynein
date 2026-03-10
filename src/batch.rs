@@ -211,15 +211,30 @@ pub fn build_batch_request_items_from_json(
     Ok(results)
 }
 
-/// this function calls BatchWriteItem API and returns UnprocessedItems.
+/// Creates a `DynamoDbSdkClient` with batch-write-specific retry configuration.
+/// Use this to create a single client instance that can be reused across multiple
+/// batch write operations, which avoids creating a new TCP connection for every request
+/// and prevents ephemeral port exhaustion (TCP TIME_WAIT accumulation).
+pub async fn create_batch_client(cx: &app::Context) -> DynamoDbSdkClient {
+    let retry_config = cx
+        .retry
+        .as_ref()
+        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
+    let config = cx
+        .effective_sdk_config_with_retry(retry_config.cloned())
+        .await;
+    DynamoDbSdkClient::new(&config)
+}
+
+/// Calls BatchWriteItem API using a pre-built client and returns UnprocessedItems.
 /// Though the type of res.unprocessed_items is `Option`, when all items are written, `Some({})` would be returned instead of `None`.
 /// ref: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html
 /// > If any requested operations fail because the table's provisioned throughput is exceeded or an internal processing failure occurs,
 /// > the failed operations are returned in the UnprocessedItems response parameter.
 /// > You can investigate and optionally resend the requests. Typically, you would call BatchWriteItem in a loop. Each iteration would
 /// > check for unprocessed items and submit a new BatchWriteItem request with those unprocessed items until all items have been processed.
-async fn batch_write_item_api(
-    cx: &app::Context,
+async fn batch_write_item_api_with_client(
+    client: &DynamoDbSdkClient,
     request_items: HashMap<String, Vec<WriteRequest>>,
 ) -> Result<
     Option<HashMap<String, Vec<WriteRequest>>>,
@@ -230,16 +245,7 @@ async fn batch_write_item_api(
         &request_items
     );
 
-    let retry_config = cx
-        .retry
-        .as_ref()
-        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
-    let config = cx
-        .effective_sdk_config_with_retry(retry_config.cloned())
-        .await;
-    let ddb = DynamoDbSdkClient::new(&config);
-
-    match ddb
+    match client
         .batch_write_item()
         .set_request_items(Some(request_items))
         .send()
@@ -250,17 +256,32 @@ async fn batch_write_item_api(
     }
 }
 
-// Basically this function is intended to be defined as `pub async fn`.
-// However, to recursively use async function, you have to return a future wrapped by pinned box. For more details: `rustc --explain E0733`.
-pub async fn batch_write_until_processed(
+/// Calls BatchWriteItem API (creates a new client each call).
+/// For repeated calls in a loop, prefer using `create_batch_client` + `batch_write_until_processed_with_client`
+/// to reuse TCP connections across requests.
+async fn batch_write_item_api(
     cx: &app::Context,
+    request_items: HashMap<String, Vec<WriteRequest>>,
+) -> Result<
+    Option<HashMap<String, Vec<WriteRequest>>>,
+    aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>,
+> {
+    let client = create_batch_client(cx).await;
+    batch_write_item_api_with_client(&client, request_items).await
+}
+
+/// Calls BatchWriteItem API using a pre-built client, retrying until all items are processed.
+/// This is the preferred function for bulk write loops because it reuses the TCP connection pool,
+/// avoiding ephemeral port exhaustion when writing many batches in succession.
+pub async fn batch_write_until_processed_with_client(
+    client: &DynamoDbSdkClient,
     mut request_items: HashMap<String, Vec<WriteRequest>>,
 ) -> Result<(), aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>> {
     loop {
-        request_items = match batch_write_item_api(cx, request_items).await {
+        request_items = match batch_write_item_api_with_client(client, request_items).await {
             Ok(result) => {
                 let unprocessed_items: HashMap<String, Vec<WriteRequest>> =
-                    result.expect("alwasy wrapped by Some");
+                    result.expect("always wrapped by Some");
                 if !unprocessed_items.is_empty() {
                     // if there are any unprocessed items, retry rest items
                     debug!("UnprocessedItems: {:?}", &unprocessed_items);
@@ -272,6 +293,16 @@ pub async fn batch_write_until_processed(
             Err(e) => return Err(e),
         }
     }
+}
+
+// Basically this function is intended to be defined as `pub async fn`.
+// However, to recursively use async function, you have to return a future wrapped by pinned box. For more details: `rustc --explain E0733`.
+pub async fn batch_write_until_processed(
+    cx: &app::Context,
+    request_items: HashMap<String, Vec<WriteRequest>>,
+) -> Result<(), aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>> {
+    let client = create_batch_client(cx).await;
+    batch_write_until_processed_with_client(&client, request_items).await
 }
 
 /// This function is intended to be called from main.rs, as a destination of bwrite command.
@@ -632,4 +663,138 @@ fn generate_type_mismatch_error_message(attr_name: &str, expected_type: &str) ->
         "type mismatch for the key {}, expected: {}",
         attr_name, expected_type
     )
+}
+
+/* =================================================
+Unit Tests
+================================================= */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- build_batch_request_items_from_json ---
+
+    #[test]
+    fn test_build_batch_request_items_put_request() {
+        let json = r#"{"TestTable": [{"PutRequest": {"Item": {"pk": {"S": "key1"}, "val": {"N": "123"}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("TestTable"));
+        let requests = &result["TestTable"];
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].put_request().is_some());
+        let item = requests[0].put_request().unwrap().item();
+        assert_eq!(item.get("pk").unwrap(), &AttributeValue::S("key1".to_string()));
+        assert_eq!(item.get("val").unwrap(), &AttributeValue::N("123".to_string()));
+    }
+
+    #[test]
+    fn test_build_batch_request_items_delete_request() {
+        let json = r#"{"TestTable": [{"DeleteRequest": {"Key": {"pk": {"S": "key1"}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("TestTable"));
+        let requests = &result["TestTable"];
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].delete_request().is_some());
+        let key = requests[0].delete_request().unwrap().key();
+        assert_eq!(key.get("pk").unwrap(), &AttributeValue::S("key1".to_string()));
+    }
+
+    #[test]
+    fn test_build_batch_request_items_mixed_operations() {
+        let json = r#"{"TestTable": [
+            {"PutRequest":    {"Item": {"pk": {"S": "key1"}}}},
+            {"PutRequest":    {"Item": {"pk": {"S": "key2"}}}},
+            {"DeleteRequest": {"Key":  {"pk": {"S": "key3"}}}}
+        ]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("TestTable"));
+        assert_eq!(result["TestTable"].len(), 3);
+        assert!(result["TestTable"][0].put_request().is_some());
+        assert!(result["TestTable"][1].put_request().is_some());
+        assert!(result["TestTable"][2].delete_request().is_some());
+    }
+
+    #[test]
+    fn test_build_batch_request_items_multiple_tables() {
+        let json = r#"{
+            "Table1": [{"PutRequest": {"Item": {"pk": {"S": "key1"}}}}],
+            "Table2": [{"PutRequest": {"Item": {"pk": {"S": "key2"}}}}]
+        }"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("Table1"));
+        assert!(result.contains_key("Table2"));
+        assert_eq!(result["Table1"].len(), 1);
+        assert_eq!(result["Table2"].len(), 1);
+    }
+
+    #[test]
+    fn test_build_batch_request_items_invalid_json() {
+        let result = build_batch_request_items_from_json("invalid json".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_batch_request_items_all_scalar_types() {
+        let json = r#"{"TestTable": [{"PutRequest": {"Item": {
+            "s":    {"S":    "hello"},
+            "n":    {"N":    "42"},
+            "bool": {"BOOL": true},
+            "null": {"NULL": true},
+            "ss":   {"SS":   ["a", "b"]},
+            "ns":   {"NS":   ["1", "2"]}
+        }}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        let item = result["TestTable"][0].put_request().unwrap().item();
+
+        assert_eq!(item.get("s").unwrap(),    &AttributeValue::S("hello".to_string()));
+        assert_eq!(item.get("n").unwrap(),    &AttributeValue::N("42".to_string()));
+        assert_eq!(item.get("bool").unwrap(), &AttributeValue::Bool(true));
+        assert_eq!(item.get("null").unwrap(), &AttributeValue::Null(true));
+        assert_eq!(
+            item.get("ss").unwrap(),
+            &AttributeValue::Ss(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            item.get("ns").unwrap(),
+            &AttributeValue::Ns(vec!["1".to_string(), "2".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_build_batch_request_items_list_type() {
+        let json = r#"{"T": [{"PutRequest": {"Item": {"l": {"L": [{"S": "item1"}, {"N": "99"}]}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        let item = result["T"][0].put_request().unwrap().item();
+
+        assert_eq!(
+            item.get("l").unwrap(),
+            &AttributeValue::L(vec![
+                AttributeValue::S("item1".to_string()),
+                AttributeValue::N("99".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_build_batch_request_items_map_type() {
+        let json = r#"{"T": [{"PutRequest": {"Item": {"m": {"M": {"inner": {"S": "val"}}}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        let item = result["T"][0].put_request().unwrap().item();
+
+        let expected_map = HashMap::from([("inner".to_string(), AttributeValue::S("val".to_string()))]);
+        assert_eq!(item.get("m").unwrap(), &AttributeValue::M(expected_map));
+    }
+
+    #[test]
+    fn test_build_batch_request_items_empty_table() {
+        let json = r#"{"TestTable": []}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        assert!(result.contains_key("TestTable"));
+        assert_eq!(result["TestTable"].len(), 0);
+    }
 }

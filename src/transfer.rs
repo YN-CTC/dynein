@@ -32,6 +32,7 @@ use tokio::time::sleep;
 use aws_sdk_dynamodb::{
     operation::scan::ScanOutput,
     types::{AttributeValue, WriteRequest},
+    Client as DynamoDbSdkClient,
 };
 use thiserror::Error;
 
@@ -434,6 +435,10 @@ pub async fn import(
                 .collect::<Vec<&str>>(); // remove blank line (e.g. last line)
             let headers: Vec<&str> = lines[0].split(',').collect::<Vec<&str>>();
             let mut matrix: Vec<Vec<&str>> = vec![];
+            // Create a single client instance to reuse TCP connections across all batch writes.
+            // This avoids ephemeral port exhaustion caused by TIME_WAIT accumulation when a new
+            // client (and thus a new TCP connection) is created for every request.
+            let client = batch::create_batch_client(cx).await;
             // Iterate over lines (from index = 1, as index = 0 is the header line)
             let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
             let mut rate_limiter_mut = rate_limiter;
@@ -445,7 +450,7 @@ pub async fn import(
                     if let Some(ref mut rl) = rate_limiter_mut {
                         rl.wait_if_needed(25).await;
                     }
-                    write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
+                    write_csv_matrix(cx, &client, &matrix, &headers, enable_set_inference).await?;
                     progress_status.add_observation(25);
                     progress_status.show();
                     matrix.clear();
@@ -456,7 +461,7 @@ pub async fn import(
                 if let Some(ref mut rl) = rate_limiter_mut {
                     rl.wait_if_needed(matrix.len()).await;
                 }
-                write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
+                write_csv_matrix(cx, &client, &matrix, &headers, enable_set_inference).await?;
                 progress_status.add_observation(matrix.len());
                 progress_status.show();
             }
@@ -651,6 +656,10 @@ async fn write_array_of_jsons_with_chunked_25(
 ) -> Result<(), batch::DyneinBatchError> {
     let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
     let mut rate_limiter_mut = rate_limiter;
+    // Create a single client instance to reuse TCP connections across all batch writes.
+    // This avoids ephemeral port exhaustion caused by TIME_WAIT accumulation when a new
+    // client (and thus a new TCP connection) is created for every request.
+    let client = batch::create_batch_client(cx).await;
     for chunk /* Vec<JsonValue> */ in array_of_json_obj.chunks(25) { // As BatchWriteItem request can have up to 25 items.
         let items = chunk.to_vec();
         let count = items.len();
@@ -659,7 +668,7 @@ async fn write_array_of_jsons_with_chunked_25(
             rl.wait_if_needed(count).await;
         }
         let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, items, enable_set_inference).await?;
-        batch::batch_write_until_processed(cx, request_items).await?;
+        batch::batch_write_until_processed_with_client(&client, request_items).await?;
         progress_status.add_observation(count);
         progress_status.show();
     }
@@ -668,6 +677,7 @@ async fn write_array_of_jsons_with_chunked_25(
 
 /// This function takes "matrix" with "headers", builds a parameter for BatchWriteItem, then write it untill they've been processed all.
 /// The "matrix" is a data built from CSV file and each "cell/column" is an attribute of a item.
+/// Accepts a pre-built `client` to reuse TCP connections across repeated calls.
 ///
 /// e.g.
 ///    name, age, fruit ... headers
@@ -676,13 +686,14 @@ async fn write_array_of_jsons_with_chunked_25(
 ///  [Shu, 42, Banana]] ... matrix
 async fn write_csv_matrix(
     cx: &app::Context,
+    client: &DynamoDbSdkClient,
     matrix: &[Vec<&str>],
     headers: &[&str],
     enable_set_inference: bool,
 ) -> Result<(), batch::DyneinBatchError> {
     let request_items: HashMap<String, Vec<WriteRequest>> =
         batch::csv_matrix_to_request_items(cx, matrix, headers, enable_set_inference).await?;
-    batch::batch_write_until_processed(cx, request_items).await?;
+    batch::batch_write_until_processed_with_client(client, request_items).await?;
     Ok(())
 }
 
@@ -691,6 +702,90 @@ mod tests {
     use super::*;
     use std::ops::Add;
     use std::time::Duration;
+
+    // --- RateLimiter ---
+
+    #[test]
+    fn test_rate_limiter_initialization() {
+        let rl = RateLimiter::new(1000, 50);
+        assert_eq!(rl.target_wps, 500.0);
+        assert!(rl.last_write_time.is_none());
+        assert_eq!(rl.last_batch_size, 0);
+    }
+
+    #[test]
+    fn test_rate_limiter_full_percentage() {
+        let rl = RateLimiter::new(500, 100);
+        assert_eq!(rl.target_wps, 500.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_half_percentage() {
+        let rl = RateLimiter::new(10000, 50);
+        assert_eq!(rl.target_wps, 5000.0);
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_percentage() {
+        let rl = RateLimiter::new(10000, 0);
+        assert_eq!(rl.target_wps, 0.0);
+    }
+
+    /// Verify that the first call to `wait_if_needed` does not block and correctly
+    /// updates internal state (last_write_time and last_batch_size).
+    #[tokio::test]
+    async fn test_rate_limiter_first_call_updates_state() {
+        let mut rl = RateLimiter::new(1000, 100);
+        assert!(rl.last_write_time.is_none());
+        assert_eq!(rl.last_batch_size, 0);
+
+        // First call should not sleep because last_write_time is None.
+        rl.wait_if_needed(25).await;
+
+        assert!(rl.last_write_time.is_some());
+        assert_eq!(rl.last_batch_size, 25);
+    }
+
+    /// Verify that each call to `wait_if_needed` updates last_batch_size to the
+    /// new batch size, so the next call uses it for delay calculation.
+    #[tokio::test]
+    async fn test_rate_limiter_batch_size_updated_each_call() {
+        let mut rl = RateLimiter::new(1000, 100);
+
+        rl.wait_if_needed(10).await;
+        assert_eq!(rl.last_batch_size, 10);
+
+        // Sleep long enough to avoid being throttled, then call with a different size.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        rl.wait_if_needed(25).await;
+        assert_eq!(rl.last_batch_size, 25);
+    }
+
+    /// Verify that a slow WCU rate causes a measurable delay between calls.
+    /// We set WCU=1 (1 item/sec). Writing a batch of 1 item should require ~1s
+    /// before the next batch is allowed. Here we use a very small target to make
+    /// the test fast: 10 WCU at 10% = 1 write/sec.
+    #[tokio::test]
+    async fn test_rate_limiter_imposes_delay() {
+        // target_wps = 100 WCU * 10% = 10 items/sec
+        // Writing 10 items means minimum elapsed = 10 / 10 = 1.0s before next call.
+        // To keep the test fast we use a tighter scenario:
+        //   10 WCU * 100% = 10 items/sec => min_duration for 5 items = 0.5s
+        let mut rl = RateLimiter::new(10, 100); // target_wps = 10
+        rl.wait_if_needed(5).await; // first call: no delay, just records time
+        let before = Instant::now();
+        rl.wait_if_needed(1).await; // second call: should sleep ~(5/10 - elapsed) seconds
+        let elapsed = before.elapsed();
+
+        // We expect a delay of roughly 0.5s (5 items / 10 wps). Allow a 200ms margin.
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "Expected delay >=400ms, got {:?}",
+            elapsed
+        );
+    }
+
+    // --- ProgressState ---
 
     #[test]
     fn test_progress_status() {

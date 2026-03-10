@@ -16,7 +16,8 @@
 
 use ::serde::{Deserialize, Serialize};
 use aws_config::{
-    meta::region::RegionProviderChain, retry::RetryConfig, BehaviorVersion, Region, SdkConfig,
+    meta::region::RegionProviderChain, retry::RetryConfig, timeout::TimeoutConfig,
+    BehaviorVersion, Region, SdkConfig,
 };
 use aws_sdk_dynamodb::types::{AttributeDefinition, TableDescription};
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -277,7 +278,17 @@ impl Context {
         let sdk_region = Region::new(region_name.to_owned());
 
         let provider = RegionProviderChain::first_try(sdk_region);
-        let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(provider);
+
+        // Configure timeout settings to handle high-throughput scenarios
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(10)) // Extend connection timeout from default 1s to 10s
+            .operation_timeout(Duration::from_secs(60)) // Set operation timeout to 60s
+            .build();
+
+        let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+            .region(provider)
+            .timeout_config(timeout_config);
+
         if self.is_local().await {
             config = config.endpoint_url(format!("http://localhost:{}", self.effective_port()));
         }
