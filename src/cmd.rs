@@ -401,15 +401,35 @@ pub enum Sub {
         workers: usize,
     },
 
-    /// Delete ALL items in a DynamoDB table. (Scan + BatchWriteItem DeleteRequest)
+    /// Delete items from a DynamoDB table using parallel BatchWriteItem DeleteRequests.
     ///
-    /// This command scans the entire table and deletes every item using parallel BatchWriteItem requests.
+    /// Without --input-file: scans the entire table and deletes ALL items.{n}
+    /// With --input-file: reads items from a CSV/JSON/JSONL file (typically produced by `dy export`)
+    /// and deletes only those items. Use this to delete a specific subset:{n}
+    ///   1. dy export -o items.jsonl -f jsonl{n}
+    ///   2. (manually remove lines you want to KEEP from items.jsonl){n}
+    ///   3. dy purge -i items.jsonl -f jsonl{n}
+    ///
     /// Use --workers to control parallelism and --wcu-percent to stay within WCU budget.
     #[clap(verbatim_doc_comment)]
     Purge {
-        /// Skip interactive confirmation before deleting all items.
+        /// Skip interactive confirmation before deleting items.
         #[clap(short, long, verbatim_doc_comment)]
         yes: bool,
+
+        /// Input file path containing items to delete (e.g. exported by `dy export`).{n}
+        /// If omitted, ALL items in the table are deleted via Scan.{n}
+        /// Only primary key(s) are extracted from each record; other attributes are ignored.
+        #[clap(short, long, verbatim_doc_comment)]
+        input_file: Option<String>,
+
+        /// Data format of the input file. Required when --input-file is specified.{n}
+        ///   json = JSON format with newline/indent.{n}
+        ///   jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.{n}
+        ///   json-compact = JSON format, all items are packed in oneline.{n}
+        ///   csv = comma-separated values with header. The header must contain the primary key column(s).
+        #[clap(short, long, value_parser = ["csv", "json", "jsonl", "json-compact"], verbatim_doc_comment)]
+        format: Option<String>,
 
         /// Percentage of table's WCU (Write Capacity Units) to use for purge.{n}
         /// Only effective when the table is in Provisioned mode.{n}

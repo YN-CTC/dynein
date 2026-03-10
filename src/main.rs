@@ -233,9 +233,11 @@ async fn dispatch(context: &mut app::Context, subcommand: cmd::Sub) -> Result<()
         } => transfer::import(context, input_file, format, enable_set_inference, wcu_percent, workers).await?,
         cmd::Sub::Purge {
             yes,
+            input_file,
+            format,
             wcu_percent,
             workers,
-        } => transfer::purge(context, yes, wcu_percent, workers).await?,
+        } => transfer::purge(context, yes, input_file, format, wcu_percent, workers).await?,
         cmd::Sub::Backup { list, all_tables } => {
             if list {
                 control::list_backups(context, all_tables).await?

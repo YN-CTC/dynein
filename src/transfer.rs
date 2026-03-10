@@ -615,31 +615,61 @@ pub async fn import(
     Ok(())
 }
 
-/// Delete ALL items in a DynamoDB table by scanning and issuing parallel BatchWriteItem DeleteRequests.
+/// Delete items from a DynamoDB table using parallel BatchWriteItem DeleteRequests.
 ///
-/// The scan retrieves only primary key(s) (keys_only=true) to minimise RCU.
-/// Deletions are fanned out to `workers` concurrent BatchWriteItem requests using the same
-/// shared DynamoDB client and TokenBucket pattern as `import`.
+/// - Without `input_file`: scans the **entire** table (keys_only) and deletes ALL items.
+/// - With `input_file`: reads the specified file (JSON / JSONL / CSV) and deletes only those items.
+///   Only primary key(s) are extracted from each record; all other attributes are ignored.
+///
+/// In both modes, deletions are fanned out to `workers` concurrent BatchWriteItem requests
+/// using a shared DynamoDB client and TokenBucket (same pattern as `import`).
 pub async fn purge(
     cx: &app::Context,
     yes: bool,
+    input_file: Option<String>,
+    format: Option<String>,
     wcu_percent: Option<u8>,
     workers: usize,
 ) -> Result<(), batch::DyneinBatchError> {
     let ts: app::TableSchema = app::table_schema(cx).await;
 
-    // Confirm before wiping unless --yes is specified
+    // Confirm before deleting unless --yes is specified
     if !yes {
-        let msg = format!(
-            "This will DELETE ALL items from table '{}'. Are you sure? (This cannot be undone)",
-            ts.name
-        );
+        let msg = if input_file.is_some() {
+            format!(
+                "This will delete items listed in the input file from table '{}'. Continue?",
+                ts.name
+            )
+        } else {
+            format!(
+                "This will DELETE ALL items from table '{}'. Are you sure? (This cannot be undone)",
+                ts.name
+            )
+        };
         if !Confirm::new().with_prompt(msg).interact()? {
             println!("Operation has been cancelled.");
             return Ok(());
         }
     }
 
+    if let Some(file) = input_file {
+        // File-based: delete only items listed in the export file
+        purge_from_file(cx, &ts, file, format.as_deref(), wcu_percent, workers).await
+    } else {
+        // Scan-based: delete ALL items in the table
+        purge_all(cx, &ts, wcu_percent, workers).await
+    }
+}
+
+/// Delete ALL items in a DynamoDB table by scanning and issuing parallel BatchWriteItem DeleteRequests.
+///
+/// The scan retrieves only primary key(s) (keys_only=true) to minimise RCU.
+async fn purge_all(
+    cx: &app::Context,
+    ts: &app::TableSchema,
+    wcu_percent: Option<u8>,
+    workers: usize,
+) -> Result<(), batch::DyneinBatchError> {
     // Setup token bucket (same pattern as import)
     let token_bucket: Option<Arc<TokioMutex<TokenBucket>>> = if let Some(percent) = wcu_percent {
         if ts.mode == table::Mode::OnDemand {
@@ -688,11 +718,11 @@ pub async fn purge(
         // Scan with keys_only=true to minimise RCU consumption.
         let scan_output = data::scan_api(
             cx,
-            None,   /* index */
-            false,  /* consistent_read */
-            &None,  /* attributes */
-            true,   /* keys_only */
-            None,   /* limit */
+            None,  /* index */
+            false, /* consistent_read */
+            &None, /* attributes */
+            true,  /* keys_only */
+            None,  /* limit */
             last_evaluated_key,
         )
         .await;
@@ -731,7 +761,8 @@ pub async fn purge(
                     &ts_clone,
                 );
                 let actual_wcu =
-                    batch::batch_write_until_processed_with_client(&ddb_clone, request_items).await?;
+                    batch::batch_write_until_processed_with_client(&ddb_clone, request_items)
+                        .await?;
                 debug!(
                     "BatchWriteItem (delete) consumed {:.1} WCU this batch (actual)",
                     actual_wcu
@@ -765,6 +796,133 @@ pub async fn purge(
     // Drain remaining in-flight futures.
     while let Some(result) = in_flight.next().await {
         result?;
+    }
+
+    println!(); // newline after progress display
+    Ok(())
+}
+
+/// Delete only the items listed in `input_file` from a DynamoDB table.
+///
+/// The file is typically produced by `dy export`. Only primary key(s) are extracted from each
+/// record; other attributes are silently ignored. Supports JSON, JSONL, JSON-compact, and CSV.
+/// Deletions are fanned out to `workers` concurrent BatchWriteItem requests (same as `import`).
+async fn purge_from_file(
+    cx: &app::Context,
+    ts: &app::TableSchema,
+    input_file: String,
+    format: Option<&str>,
+    wcu_percent: Option<u8>,
+    workers: usize,
+) -> Result<(), batch::DyneinBatchError> {
+    // Setup token bucket (same pattern as import)
+    let token_bucket: Option<Arc<TokioMutex<TokenBucket>>> = if let Some(percent) = wcu_percent {
+        if ts.mode == table::Mode::OnDemand {
+            println!("WARN: --wcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
+            None
+        } else {
+            let desc = control::describe_table_api(cx, ts.name.clone()).await;
+            let wcu = desc
+                .provisioned_throughput
+                .as_ref()
+                .and_then(|pt| pt.write_capacity_units)
+                .unwrap_or(0);
+            if wcu == 0 {
+                println!("WARN: Table WCU is 0. Rate limiting will be skipped.");
+                None
+            } else {
+                let target = (wcu as f64) * (percent as f64 / 100.0);
+                println!(
+                    "Rate limiting enabled: using {}% of {} WCU ({:.1} writes/sec), workers={}",
+                    percent, wcu, target, workers
+                );
+                Some(Arc::new(TokioMutex::new(TokenBucket::new(target))))
+            }
+        }
+    } else {
+        None
+    };
+
+    let input_string: String = if Path::new(&input_file).exists() {
+        fs::read_to_string(&input_file)?
+    } else {
+        error!("Couldn't find the input file '{}'.", &input_file);
+        std::process::exit(1);
+    };
+
+    match format {
+        None | Some("json") | Some("json-compact") => {
+            let array_of_json_obj: Vec<JsonValue> = serde_json::from_str(&input_string)?;
+            delete_array_of_jsons_with_chunked_25(cx, ts, array_of_json_obj, token_bucket, workers)
+                .await?;
+        }
+        Some("jsonl") => {
+            let array_of_json_obj: StreamDeserializer<'_, StrRead<'_>, JsonValue> =
+                Deserializer::from_str(&input_string).into_iter::<JsonValue>();
+            let array_of_valid_json_obj: Vec<JsonValue> =
+                array_of_json_obj.filter_map(Result::ok).collect();
+            delete_array_of_jsons_with_chunked_25(
+                cx,
+                ts,
+                array_of_valid_json_obj,
+                token_bucket,
+                workers,
+            )
+            .await?;
+        }
+        Some("csv") => {
+            // CSV deletion is sequential (mirrors CSV import).
+            let mut rate_limiter_csv: Option<RateLimiter> = token_bucket.as_ref().map(|_| {
+                RateLimiter {
+                    target_ops: 0.0,
+                    last_operation_time: None,
+                    last_batch_size: 0,
+                    last_consumed_cu: 0.0,
+                }
+            });
+            if let (Some(percent), Some(ref mut rl)) = (wcu_percent, rate_limiter_csv.as_mut()) {
+                let desc = control::describe_table_api(cx, ts.name.clone()).await;
+                let wcu = desc
+                    .provisioned_throughput
+                    .as_ref()
+                    .and_then(|pt| pt.write_capacity_units)
+                    .unwrap_or(0);
+                rl.target_ops = (wcu as f64) * (percent as f64 / 100.0);
+            }
+
+            let lines: Vec<&str> = input_string
+                .split('\n')
+                .filter(|x| !x.is_empty())
+                .collect();
+            let headers: Vec<&str> = lines[0].split(',').collect();
+            let mut matrix: Vec<Vec<&str>> = vec![];
+            let shared_client = batch::create_batch_client(cx).await;
+            let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
+            let mut last_actual_wcu: f64 = 0.0;
+            for (i, line) in lines.iter().enumerate().skip(1) {
+                let cells: Vec<&str> = line.split(',').collect();
+                matrix.push(cells);
+                if i % 25 == 0 {
+                    if let Some(ref mut rl) = rate_limiter_csv {
+                        rl.wait_based_on_cu(last_actual_wcu).await;
+                    }
+                    last_actual_wcu = delete_csv_matrix(cx, &shared_client, ts, &matrix, &headers)
+                        .await?;
+                    progress_status.add_observation(25);
+                    progress_status.show();
+                    matrix.clear();
+                }
+            }
+            if !matrix.is_empty() {
+                if let Some(ref mut rl) = rate_limiter_csv {
+                    rl.wait_based_on_cu(last_actual_wcu).await;
+                }
+                delete_csv_matrix(cx, &shared_client, ts, &matrix, &headers).await?;
+                progress_status.add_observation(matrix.len());
+                progress_status.show();
+            }
+        }
+        Some(o) => panic!("Invalid input format is given: {}", o),
     }
 
     println!(); // newline after progress display
@@ -1024,6 +1182,104 @@ async fn write_array_of_jsons_with_chunked_25(
     }
 
     Ok(())
+}
+
+/// Delete items (from a JSON/JSONL export file) via parallel BatchWriteItem DeleteRequests
+/// (up to `workers` in-flight at a time). Mirrors `write_array_of_jsons_with_chunked_25`.
+async fn delete_array_of_jsons_with_chunked_25(
+    cx: &app::Context,
+    ts: &app::TableSchema,
+    array_of_json_obj: Vec<JsonValue>,
+    token_bucket: Option<Arc<TokioMutex<TokenBucket>>>,
+    workers: usize,
+) -> Result<(), batch::DyneinBatchError> {
+    let retry_config = cx
+        .retry
+        .as_ref()
+        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
+    let sdk_config = cx
+        .effective_sdk_config_with_retry(retry_config.cloned())
+        .await;
+    let shared_ddb = Arc::new(DynamoDbSdkClient::new(&sdk_config));
+
+    let progress = Arc::new(TokioMutex::new(ProgressState::new(MAX_NUMBER_OF_OBSERVES)));
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+
+    for chunk in array_of_json_obj.chunks(25) {
+        let items = chunk.to_vec();
+        let count = items.len();
+
+        if in_flight.len() >= workers {
+            if let Some(result) = in_flight.next().await {
+                result?;
+            }
+        }
+
+        if let Some(ref tb) = token_bucket {
+            acquire_tokens(tb, count as f64).await;
+        }
+
+        let ddb_clone = Arc::clone(&shared_ddb);
+        let tb_clone = token_bucket.clone();
+        let prog_clone = Arc::clone(&progress);
+        let ts_clone = ts.clone();
+
+        in_flight.push(async move {
+            let request_items = batch::convert_jsonvals_to_delete_request_items(
+                cx,
+                items,
+                &ts_clone,
+            )
+            .await?;
+            let actual_wcu =
+                batch::batch_write_until_processed_with_client(&ddb_clone, request_items).await?;
+            debug!(
+                "BatchWriteItem (delete from file) consumed {:.1} WCU this batch (actual)",
+                actual_wcu
+            );
+            if let Some(ref tb) = tb_clone {
+                let estimated = count as f64;
+                let diff = actual_wcu - estimated;
+                if diff > 0.0 {
+                    acquire_tokens(tb, diff).await;
+                } else if diff < 0.0 {
+                    let mut guard = tb.lock().await;
+                    guard.tokens = (guard.tokens + (-diff)).min(guard.max_burst);
+                }
+            }
+            {
+                let mut prog = prog_clone.lock().await;
+                prog.add_observation(count);
+                prog.show();
+            }
+            Ok::<(), batch::DyneinBatchError>(())
+        });
+    }
+
+    while let Some(result) = in_flight.next().await {
+        result?;
+    }
+
+    Ok(())
+}
+
+/// Deletes a CSV matrix chunk via BatchWriteItem using a shared pre-built client.
+/// Returns the actual WCU consumed (used by the sequential CSV rate limiter).
+async fn delete_csv_matrix(
+    cx: &app::Context,
+    ddb: &DynamoDbSdkClient,
+    ts: &app::TableSchema,
+    matrix: &[Vec<&str>],
+    headers: &[&str],
+) -> Result<f64, batch::DyneinBatchError> {
+    let request_items: HashMap<String, Vec<WriteRequest>> =
+        batch::csv_matrix_to_delete_request_items(cx, matrix, headers, ts).await?;
+    let consumed_wcu = batch::batch_write_until_processed_with_client(ddb, request_items).await?;
+    debug!(
+        "BatchWriteItem (delete CSV) consumed {:.1} WCU this batch (actual)",
+        consumed_wcu
+    );
+    Ok(consumed_wcu)
 }
 
 /// Writes a CSV matrix chunk via BatchWriteItem using a shared pre-built client.
