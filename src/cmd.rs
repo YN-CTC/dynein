@@ -393,20 +393,37 @@ pub enum Sub {
         /// Valid values are 1-100. e.g. --wcu-percent 50 uses 50% of the table's WCU.
         #[clap(long, value_parser = clap::value_parser!(u8).range(1..=100), verbatim_doc_comment)]
         wcu_percent: Option<u8>,
+
+        /// Number of concurrent BatchWriteItem requests to issue in parallel (default: 8).{n}
+        /// BatchWriteItem is limited to 25 items per request, so throughput = workers × 25 / RTT.{n}
+        /// Increase this value to saturate higher WCU budgets. Ignored for CSV format.
+        #[clap(long, default_value = "8", verbatim_doc_comment)]
+        workers: usize,
     },
 
-    /// Delete items in bulk from a DynamoDB table using a file exported by `dy export`. [API: BatchWriteItem]
+    /// Delete items from a DynamoDB table using parallel BatchWriteItem DeleteRequests.
     ///
-    /// Reads a CSV/JSON/JSONL file and deletes the corresponding items from the table.
-    /// Only primary key(s) are used from each item record; all other attributes are ignored.
-    /// For best performance, use OnDemand mode or specify --wcu-percent on a Provisioned table.
+    /// Without --input-file: scans the entire table and deletes ALL items.{n}
+    /// With --input-file: reads items from a CSV/JSON/JSONL file (typically produced by `dy export`)
+    /// and deletes only those items. Use this to delete a specific subset:{n}
+    ///   1. dy export -o items.jsonl -f jsonl{n}
+    ///   2. (manually remove lines you want to KEEP from items.jsonl){n}
+    ///   3. dy purge -i items.jsonl -f jsonl{n}
+    ///
+    /// Use --workers to control parallelism and --wcu-percent to stay within WCU budget.
     #[clap(verbatim_doc_comment)]
     Purge {
-        /// Input file path containing items to delete. Typically a file exported by `dy export`.
+        /// Skip interactive confirmation before deleting items.
         #[clap(short, long, verbatim_doc_comment)]
-        input_file: String,
+        yes: bool,
 
-        /// Data format of the input file.{n}
+        /// Input file path containing items to delete (e.g. exported by `dy export`).{n}
+        /// If omitted, ALL items in the table are deleted via Scan.{n}
+        /// Only primary key(s) are extracted from each record; other attributes are ignored.
+        #[clap(short, long, verbatim_doc_comment)]
+        input_file: Option<String>,
+
+        /// Data format of the input file. Required when --input-file is specified.{n}
         ///   json = JSON format with newline/indent.{n}
         ///   jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.{n}
         ///   json-compact = JSON format, all items are packed in oneline.{n}
@@ -414,15 +431,16 @@ pub enum Sub {
         #[clap(short, long, value_parser = ["csv", "json", "jsonl", "json-compact"], verbatim_doc_comment)]
         format: Option<String>,
 
-        /// Percentage of table's WCU (Write Capacity Units) to use for delete.{n}
+        /// Percentage of table's WCU (Write Capacity Units) to use for purge.{n}
         /// Only effective when the table is in Provisioned mode.{n}
         /// Valid values are 1-100. e.g. --wcu-percent 50 uses 50% of the table's WCU.
         #[clap(long, value_parser = clap::value_parser!(u8).range(1..=100), verbatim_doc_comment)]
         wcu_percent: Option<u8>,
 
-        /// Skip interactive confirmation before deleting items.
-        #[clap(short, long, verbatim_doc_comment)]
-        yes: bool,
+        /// Number of concurrent BatchWriteItem requests to issue in parallel (default: 8).{n}
+        /// BatchWriteItem is limited to 25 items per request, so throughput = workers × 25 / RTT.
+        #[clap(long, default_value = "8", verbatim_doc_comment)]
+        workers: usize,
     },
 
     /// Take backup of a DynamoDB table using on-demand backup
