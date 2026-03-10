@@ -906,41 +906,41 @@ mod tests {
     #[test]
     fn test_rate_limiter_initialization() {
         let rl = RateLimiter::new(1000, 50);
-        assert_eq!(rl.target_wps, 500.0);
-        assert!(rl.last_write_time.is_none());
+        assert_eq!(rl.target_ops, 500.0);
+        assert!(rl.last_operation_time.is_none());
         assert_eq!(rl.last_batch_size, 0);
     }
 
     #[test]
     fn test_rate_limiter_full_percentage() {
         let rl = RateLimiter::new(500, 100);
-        assert_eq!(rl.target_wps, 500.0);
+        assert_eq!(rl.target_ops, 500.0);
     }
 
     #[test]
     fn test_rate_limiter_half_percentage() {
         let rl = RateLimiter::new(10000, 50);
-        assert_eq!(rl.target_wps, 5000.0);
+        assert_eq!(rl.target_ops, 5000.0);
     }
 
     #[test]
     fn test_rate_limiter_zero_percentage() {
         let rl = RateLimiter::new(10000, 0);
-        assert_eq!(rl.target_wps, 0.0);
+        assert_eq!(rl.target_ops, 0.0);
     }
 
     /// Verify that the first call to `wait_if_needed` does not block and correctly
-    /// updates internal state (last_write_time and last_batch_size).
+    /// updates internal state (last_operation_time and last_batch_size).
     #[tokio::test]
     async fn test_rate_limiter_first_call_updates_state() {
         let mut rl = RateLimiter::new(1000, 100);
-        assert!(rl.last_write_time.is_none());
+        assert!(rl.last_operation_time.is_none());
         assert_eq!(rl.last_batch_size, 0);
 
-        // First call should not sleep because last_write_time is None.
+        // First call should not sleep because last_operation_time is None.
         rl.wait_if_needed(25).await;
 
-        assert!(rl.last_write_time.is_some());
+        assert!(rl.last_operation_time.is_some());
         assert_eq!(rl.last_batch_size, 25);
     }
 

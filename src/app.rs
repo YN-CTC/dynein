@@ -285,7 +285,7 @@ impl Context {
             .operation_timeout(Duration::from_secs(60)) // Set operation timeout to 60s
             .build();
 
-        let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        let mut config = aws_config::defaults(BehaviorVersion::latest())
             .region(provider)
             .timeout_config(timeout_config);
 
