@@ -36,6 +36,7 @@ use tokio::time::sleep;
 use aws_sdk_dynamodb::{
     operation::scan::ScanOutput,
     types::{AttributeValue, WriteRequest},
+    Client as DynamoDbSdkClient,
 };
 use thiserror::Error;
 
@@ -811,8 +812,13 @@ fn build_csv_header(
 }
 
 /// Write items via parallel BatchWriteItem requests (up to `workers` in-flight at a time).
+///
+/// A single `DynamoDbSdkClient` is created once at the start and shared across all workers
+/// via `Arc`. This ensures the underlying HTTP connection pool is reused, avoiding the
+/// "HTTP connect timeout" errors that occur when every request creates a new client/connection.
+///
 /// Rate limiting is handled by a shared token-bucket (`token_bucket`), which is checked before
-/// each batch is submitted. The lock is released before any sleep, so other workers are not blocked.
+/// each batch is submitted. The Mutex lock is held only briefly; sleeping happens outside the lock.
 async fn write_array_of_jsons_with_chunked_25(
     cx: &app::Context,
     array_of_json_obj: Vec<JsonValue>,
@@ -820,6 +826,17 @@ async fn write_array_of_jsons_with_chunked_25(
     token_bucket: Option<Arc<TokioMutex<TokenBucket>>>,
     workers: usize,
 ) -> Result<(), batch::DyneinBatchError> {
+    // Build the SDK config and shared client ONCE for the entire import.
+    // All parallel workers share this client → the connection pool is reused → no TLS timeout.
+    let retry_config = cx
+        .retry
+        .as_ref()
+        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
+    let sdk_config = cx
+        .effective_sdk_config_with_retry(retry_config.cloned())
+        .await;
+    let shared_ddb = Arc::new(DynamoDbSdkClient::new(&sdk_config));
+
     let progress = Arc::new(TokioMutex::new(ProgressState::new(MAX_NUMBER_OF_OBSERVES)));
     // FuturesUnordered drives up to `workers` BatchWriteItem futures concurrently.
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
@@ -841,6 +858,7 @@ async fn write_array_of_jsons_with_chunked_25(
             acquire_tokens(tb, count as f64).await;
         }
 
+        let ddb_clone = Arc::clone(&shared_ddb);
         let tb_clone = token_bucket.clone();
         let prog_clone = Arc::clone(&progress);
 
@@ -852,13 +870,13 @@ async fn write_array_of_jsons_with_chunked_25(
                 enable_set_inference,
             )
             .await?;
-            let actual_wcu = batch::batch_write_until_processed(cx, request_items).await?;
+            let actual_wcu =
+                batch::batch_write_until_processed_with_client(&ddb_clone, request_items).await?;
             debug!(
                 "BatchWriteItem consumed {:.1} WCU this batch (actual)",
                 actual_wcu
             );
-            // If there's a token bucket, return unused tokens (actual < estimated)
-            // or consume extra tokens (actual > estimated) to keep accounting accurate.
+            // If there's a token bucket, reconcile actual vs estimated WCU consumption.
             if let Some(ref tb) = tb_clone {
                 let estimated = count as f64;
                 let diff = actual_wcu - estimated;
@@ -866,7 +884,7 @@ async fn write_array_of_jsons_with_chunked_25(
                     // Consumed more than estimated: deduct the extra from the bucket.
                     acquire_tokens(tb, diff).await;
                 } else if diff < 0.0 {
-                    // Consumed less: refund by adding tokens back (capped at max_burst).
+                    // Consumed less: refund tokens back (capped at max_burst).
                     let mut guard = tb.lock().await;
                     guard.tokens = (guard.tokens + (-diff)).min(guard.max_burst);
                 }
