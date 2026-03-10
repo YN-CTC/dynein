@@ -392,7 +392,7 @@ impl Context {
 
     pub fn should_strict_for_query(&self) -> bool {
         self.should_strict_for_query
-            .unwrap_or_else(|| self.config.as_ref().map_or(false, |c| c.query.strict_mode))
+            .unwrap_or_else(|| self.config.as_ref().is_some_and(|c| c.query.strict_mode))
     }
 
     pub async fn is_local(&self) -> bool {
