@@ -15,7 +15,10 @@
  */
 
 use console::Term;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
@@ -27,6 +30,7 @@ use std::{
 use dialoguer::Confirm;
 use log::{debug, error};
 use serde_json::{de::StrRead, Deserializer, StreamDeserializer, Value as JsonValue};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
 use aws_sdk_dynamodb::{
@@ -133,6 +137,59 @@ impl ProgressState {
 }
 
 const MAX_NUMBER_OF_OBSERVES: usize = 10;
+
+/// Token-bucket rate limiter for parallel write operations.
+/// Tokens represent capacity units (WCU) replenished at `rate` per second.
+struct TokenBucket {
+    tokens: f64,
+    rate: f64,
+    last_refill: Instant,
+    max_burst: f64,
+}
+
+impl TokenBucket {
+    fn new(rate: f64) -> Self {
+        TokenBucket {
+            tokens: rate.min(100.0), // start with at most 100 tokens (avoid initial burst)
+            rate,
+            last_refill: Instant::now(),
+            max_burst: rate, // allow up to 1 second of accumulated tokens
+        }
+    }
+
+    /// Try to consume `amount` tokens.
+    /// Returns `Duration::ZERO` if successful, otherwise how long to wait before retrying.
+    fn try_consume(&mut self, amount: f64) -> Duration {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.max_burst);
+        self.last_refill = now;
+
+        if self.tokens >= amount {
+            self.tokens -= amount;
+            Duration::ZERO
+        } else {
+            let deficit = amount - self.tokens;
+            Duration::from_secs_f64(deficit / self.rate)
+        }
+    }
+}
+
+/// Acquire `amount` tokens from the shared token bucket, sleeping if the bucket is empty.
+/// The Mutex is held only briefly (for the `try_consume` calculation), then released before sleeping.
+async fn acquire_tokens(tb: &Arc<TokioMutex<TokenBucket>>, amount: f64) {
+    loop {
+        let wait = {
+            let mut guard = tb.lock().await;
+            guard.try_consume(amount)
+        }; // lock released here
+        if wait == Duration::ZERO {
+            break;
+        }
+        debug!("Token bucket empty; sleeping {:?} before next batch", wait);
+        sleep(wait).await;
+    }
+}
 
 /// Rate limiter for controlling throughput based on capacity unit percentage.
 /// Can be used for both write (WCU) and read (RCU) operations.
@@ -429,13 +486,16 @@ pub async fn import(
     format: Option<String>,
     enable_set_inference: bool,
     wcu_percent: Option<u8>,
+    workers: usize,
 ) -> Result<(), batch::DyneinBatchError> {
     let format_str: Option<&str> = format.as_deref();
 
     let ts: app::TableSchema = app::table_schema(cx).await;
 
-    // Initialize rate limiter if wcu_percent is specified
-    let rate_limiter: Option<RateLimiter> = if let Some(percent) = wcu_percent {
+    // Initialize token-bucket rate limiter if wcu_percent is specified.
+    // For JSON/JSONL paths the token bucket is shared across parallel workers.
+    // For CSV the existing sequential RateLimiter is used instead.
+    let token_bucket: Option<Arc<TokioMutex<TokenBucket>>> = if let Some(percent) = wcu_percent {
         if ts.mode == table::Mode::OnDemand {
             println!("WARN: --wcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
             None
@@ -452,13 +512,12 @@ pub async fn import(
                 println!("WARN: Table WCU is 0. Rate limiting will be skipped.");
                 None
             } else {
+                let target = (wcu as f64) * (percent as f64 / 100.0);
                 println!(
-                    "Rate limiting enabled: using {}% of {} WCU ({:.1} writes/sec)",
-                    percent,
-                    wcu,
-                    (wcu as f64) * (percent as f64 / 100.0)
+                    "Rate limiting enabled: using {}% of {} WCU ({:.1} writes/sec), workers={}",
+                    percent, wcu, target, workers
                 );
-                Some(RateLimiter::new(wcu, percent))
+                Some(Arc::new(TokioMutex::new(TokenBucket::new(target))))
             }
         }
     } else {
@@ -487,7 +546,8 @@ pub async fn import(
                 cx,
                 array_of_json_obj,
                 enable_set_inference,
-                rate_limiter.clone(),
+                token_bucket,
+                workers,
             )
             .await?;
         }
@@ -502,11 +562,35 @@ pub async fn import(
                 cx,
                 array_of_valid_json_obj,
                 enable_set_inference,
-                rate_limiter.clone(),
+                token_bucket,
+                workers,
             )
             .await?;
         }
         Some("csv") => {
+            // CSV import remains sequential; reuse the sequential RateLimiter for WCU control.
+            let mut rate_limiter_csv: Option<RateLimiter> = token_bucket.as_ref().map(|_| {
+                // Reconstruct a sequential RateLimiter from the token_bucket's rate.
+                // We stored the target as target_ops inside the token bucket; re-derive from wcu_percent.
+                // Fallback: use a dummy that won't throttle (we'll just use wait_based_on_cu).
+                RateLimiter {
+                    target_ops: 0.0, // will be overridden below
+                    last_operation_time: None,
+                    last_batch_size: 0,
+                    last_consumed_cu: 0.0,
+                }
+            });
+            // Re-derive target_ops for CSV rate limiting from wcu_percent if set
+            if let (Some(percent), Some(ref mut rl)) = (wcu_percent, rate_limiter_csv.as_mut()) {
+                let desc = control::describe_table_api(cx, ts.name.clone()).await;
+                let wcu = desc
+                    .provisioned_throughput
+                    .as_ref()
+                    .and_then(|pt| pt.write_capacity_units)
+                    .unwrap_or(0);
+                rl.target_ops = (wcu as f64) * (percent as f64 / 100.0);
+            }
+
             let lines: Vec<&str> = input_string
                 .split('\n')
                 .collect::<Vec<&str>>() // split by "\n" and get lines
@@ -517,7 +601,6 @@ pub async fn import(
             let mut matrix: Vec<Vec<&str>> = vec![];
             // Iterate over lines (from index = 1, as index = 0 is the header line)
             let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
-            let mut rate_limiter_mut = rate_limiter;
             // WCU consumed by the previous BatchWriteItem call; 0.0 on the first batch (no delay).
             let mut last_actual_wcu: f64 = 0.0;
             for (i, line) in lines.iter().enumerate().skip(1) {
@@ -525,7 +608,7 @@ pub async fn import(
                 debug!("splitted line => {:?}", cells);
                 matrix.push(cells);
                 if i % 25 == 0 {
-                    if let Some(ref mut rl) = rate_limiter_mut {
+                    if let Some(ref mut rl) = rate_limiter_csv {
                         rl.wait_based_on_cu(last_actual_wcu).await;
                     }
                     last_actual_wcu =
@@ -537,7 +620,7 @@ pub async fn import(
             }
             debug!("rest of matrix => {:?}", matrix);
             if !matrix.is_empty() {
-                if let Some(ref mut rl) = rate_limiter_mut {
+                if let Some(ref mut rl) = rate_limiter_csv {
                     rl.wait_based_on_cu(last_actual_wcu).await;
                 }
                 write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
@@ -727,29 +810,81 @@ fn build_csv_header(
     header_str
 }
 
+/// Write items via parallel BatchWriteItem requests (up to `workers` in-flight at a time).
+/// Rate limiting is handled by a shared token-bucket (`token_bucket`), which is checked before
+/// each batch is submitted. The lock is released before any sleep, so other workers are not blocked.
 async fn write_array_of_jsons_with_chunked_25(
     cx: &app::Context,
     array_of_json_obj: Vec<JsonValue>,
     enable_set_inference: bool,
-    rate_limiter: Option<RateLimiter>,
+    token_bucket: Option<Arc<TokioMutex<TokenBucket>>>,
+    workers: usize,
 ) -> Result<(), batch::DyneinBatchError> {
-    let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
-    let mut rate_limiter_mut = rate_limiter;
-    // WCU consumed by the previous BatchWriteItem call; 0.0 on the first iteration (no delay).
-    let mut last_actual_wcu: f64 = 0.0;
-    for chunk /* Vec<JsonValue> */ in array_of_json_obj.chunks(25) { // As BatchWriteItem request can have up to 25 items.
+    let progress = Arc::new(TokioMutex::new(ProgressState::new(MAX_NUMBER_OF_OBSERVES)));
+    // FuturesUnordered drives up to `workers` BatchWriteItem futures concurrently.
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+
+    for chunk in array_of_json_obj.chunks(25) {
         let items = chunk.to_vec();
         let count = items.len();
-        // Apply rate limiting based on actual WCU consumed by the previous batch.
-        if let Some(ref mut rl) = rate_limiter_mut {
-            rl.wait_based_on_cu(last_actual_wcu).await;
+
+        // When at capacity: wait for one in-flight batch to finish before submitting another.
+        if in_flight.len() >= workers {
+            if let Some(result) = in_flight.next().await {
+                result?;
+            }
         }
-        let request_items: HashMap<String, Vec<WriteRequest>> = batch::convert_jsonvals_to_request_items(cx, items, enable_set_inference).await?;
-        last_actual_wcu = batch::batch_write_until_processed(cx, request_items).await?;
-        debug!("BatchWriteItem consumed {:.1} WCU this batch (actual)", last_actual_wcu);
-        progress_status.add_observation(count);
-        progress_status.show();
+
+        // Rate-limit: acquire tokens based on estimated WCU (1 token ≈ 1 WCU for ≤1KB items).
+        // The lock is held only briefly; sleeping happens outside the lock.
+        if let Some(ref tb) = token_bucket {
+            acquire_tokens(tb, count as f64).await;
+        }
+
+        let tb_clone = token_bucket.clone();
+        let prog_clone = Arc::clone(&progress);
+
+        // cx is &app::Context (a fat pointer), captured by copy into the async move block.
+        in_flight.push(async move {
+            let request_items = batch::convert_jsonvals_to_request_items(
+                cx,
+                items,
+                enable_set_inference,
+            )
+            .await?;
+            let actual_wcu = batch::batch_write_until_processed(cx, request_items).await?;
+            debug!(
+                "BatchWriteItem consumed {:.1} WCU this batch (actual)",
+                actual_wcu
+            );
+            // If there's a token bucket, return unused tokens (actual < estimated)
+            // or consume extra tokens (actual > estimated) to keep accounting accurate.
+            if let Some(ref tb) = tb_clone {
+                let estimated = count as f64;
+                let diff = actual_wcu - estimated;
+                if diff > 0.0 {
+                    // Consumed more than estimated: deduct the extra from the bucket.
+                    acquire_tokens(tb, diff).await;
+                } else if diff < 0.0 {
+                    // Consumed less: refund by adding tokens back (capped at max_burst).
+                    let mut guard = tb.lock().await;
+                    guard.tokens = (guard.tokens + (-diff)).min(guard.max_burst);
+                }
+            }
+            {
+                let mut prog = prog_clone.lock().await;
+                prog.add_observation(count);
+                prog.show();
+            }
+            Ok::<(), batch::DyneinBatchError>(())
+        });
     }
+
+    // Drain any remaining in-flight futures.
+    while let Some(result) = in_flight.next().await {
+        result?;
+    }
+
     Ok(())
 }
 

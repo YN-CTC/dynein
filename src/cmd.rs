@@ -393,6 +393,12 @@ pub enum Sub {
         /// Valid values are 1-100. e.g. --wcu-percent 50 uses 50% of the table's WCU.
         #[clap(long, value_parser = clap::value_parser!(u8).range(1..=100), verbatim_doc_comment)]
         wcu_percent: Option<u8>,
+
+        /// Number of concurrent BatchWriteItem requests to issue in parallel (default: 8).{n}
+        /// BatchWriteItem is limited to 25 items per request, so throughput = workers × 25 / RTT.{n}
+        /// Increase this value to saturate higher WCU budgets. Ignored for CSV format.
+        #[clap(long, default_value = "8", verbatim_doc_comment)]
+        workers: usize,
     },
 
     /// Take backup of a DynamoDB table using on-demand backup

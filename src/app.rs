@@ -793,7 +793,7 @@ mod tests {
         };
         assert_eq!(
             &cx1.effective_region().await,
-            aws_config::load_defaults(BehaviorVersion::v2024_03_28())
+            aws_config::load_defaults(BehaviorVersion::v2025_08_07())
                 .await
                 .region()
                 .unwrap_or(&Region::from_static("us-east-1"))
