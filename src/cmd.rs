@@ -389,6 +389,36 @@ pub enum Sub {
         wcu_percent: Option<u8>,
     },
 
+    /// Delete items in bulk from a DynamoDB table using a file exported by `dy export`. [API: BatchWriteItem]
+    ///
+    /// Reads a CSV/JSON/JSONL file and deletes the corresponding items from the table.
+    /// Only primary key(s) are used from each item record; all other attributes are ignored.
+    /// For best performance, use OnDemand mode or specify --wcu-percent on a Provisioned table.
+    #[clap(verbatim_doc_comment)]
+    Purge {
+        /// Input file path containing items to delete. Typically a file exported by `dy export`.
+        #[clap(short, long, verbatim_doc_comment)]
+        input_file: String,
+
+        /// Data format of the input file.{n}
+        ///   json = JSON format with newline/indent.{n}
+        ///   jsonl = JSON Lines (http://jsonlines.org). i.e. one item per line.{n}
+        ///   json-compact = JSON format, all items are packed in oneline.{n}
+        ///   csv = comma-separated values with header. The header must contain the primary key column(s).
+        #[clap(short, long, value_parser = ["csv", "json", "jsonl", "json-compact"], verbatim_doc_comment)]
+        format: Option<String>,
+
+        /// Percentage of table's WCU (Write Capacity Units) to use for delete.{n}
+        /// Only effective when the table is in Provisioned mode.{n}
+        /// Valid values are 1-100. e.g. --wcu-percent 50 uses 50% of the table's WCU.
+        #[clap(long, value_parser = clap::value_parser!(u8).range(1..=100), verbatim_doc_comment)]
+        wcu_percent: Option<u8>,
+
+        /// Skip interactive confirmation before deleting items.
+        #[clap(short, long, verbatim_doc_comment)]
+        yes: bool,
+    },
+
     /// Take backup of a DynamoDB table using on-demand backup
     ///
     /// For more details: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BackupRestore.html

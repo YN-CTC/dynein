@@ -477,6 +477,133 @@ pub async fn csv_matrix_to_request_items(
     Ok(results)
 }
 
+/// Builds BatchWriteItem request items using DeleteRequest by extracting only the
+/// primary key(s) from each JSON item.  All non-key attributes in the items are ignored.
+/// This mirrors `convert_jsonvals_to_request_items` but produces DeleteRequests instead of PutRequests.
+pub async fn convert_jsonvals_to_delete_request_items(
+    cx: &app::Context,
+    items_jsonval: Vec<JsonValue>,
+    ts: &app::TableSchema,
+) -> Result<HashMap<String, Vec<WriteRequest>>, DyneinBatchError> {
+    let mut results = HashMap::<String, Vec<WriteRequest>>::new();
+    let mut write_requests = Vec::<WriteRequest>::new();
+
+    for item_jsonval in items_jsonval {
+        let mut item_key = HashMap::<String, AttributeValue>::new();
+        let obj = item_jsonval
+            .as_object()
+            .expect("each item should be a valid JSON object");
+
+        // Extract PK value
+        if let Some(pk_val) = obj.get(&ts.pk.name) {
+            item_key.insert(
+                ts.pk.name.clone(),
+                data::dispatch_jsonvalue_to_attrval(pk_val, false),
+            );
+        }
+
+        // Extract SK value (if the table has a sort key)
+        if let Some(sk) = &ts.sk {
+            if let Some(sk_val) = obj.get(&sk.name) {
+                item_key.insert(
+                    sk.name.clone(),
+                    data::dispatch_jsonvalue_to_attrval(sk_val, false),
+                );
+            }
+        }
+
+        write_requests.push(
+            WriteRequest::builder()
+                .delete_request(
+                    DeleteRequest::builder()
+                        .set_key(Some(item_key))
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        );
+    }
+
+    results.insert(cx.effective_table_name(), write_requests);
+    Ok(results)
+}
+
+/// Builds BatchWriteItem request items using DeleteRequest from a CSV matrix.
+/// Only PK (and SK if present) columns are extracted; all other columns are ignored.
+/// `headers` must contain the PK/SK column names matching the table schema.
+pub async fn csv_matrix_to_delete_request_items(
+    cx: &app::Context,
+    matrix: &[Vec<&str>],
+    headers: &[&str],
+    ts: &app::TableSchema,
+) -> Result<HashMap<String, Vec<WriteRequest>>, DyneinBatchError> {
+    // Resolve PK column index
+    let pk_idx = headers
+        .iter()
+        .position(|h| *h == ts.pk.name)
+        .ok_or_else(|| {
+            DyneinBatchError::InvalidInput(format!(
+                "PK '{}' not found in CSV headers",
+                ts.pk.name
+            ))
+        })?;
+
+    // Resolve SK column index (optional)
+    let sk_idx: Option<(usize, String)> = ts
+        .sk
+        .as_ref()
+        .map(|sk| {
+            headers
+                .iter()
+                .position(|h| *h == sk.name)
+                .map(|idx| (idx, sk.name.clone()))
+                .ok_or_else(|| {
+                    DyneinBatchError::InvalidInput(format!(
+                        "SK '{}' not found in CSV headers",
+                        sk.name
+                    ))
+                })
+        })
+        .transpose()?;
+
+    let mut results = HashMap::<String, Vec<WriteRequest>>::new();
+    let mut write_requests = Vec::<WriteRequest>::new();
+
+    for cells in matrix {
+        let mut item_key = HashMap::<String, AttributeValue>::new();
+
+        // PK
+        let pk_jsonval: serde_json::Value = serde_json::from_str(cells[pk_idx])?;
+        item_key.insert(
+            ts.pk.name.clone(),
+            data::dispatch_jsonvalue_to_attrval(&pk_jsonval, false),
+        );
+
+        // SK (if present)
+        if let Some((sk_col_idx, ref sk_name)) = sk_idx {
+            let sk_jsonval: serde_json::Value = serde_json::from_str(cells[sk_col_idx])?;
+            item_key.insert(
+                sk_name.clone(),
+                data::dispatch_jsonvalue_to_attrval(&sk_jsonval, false),
+            );
+        }
+
+        write_requests.push(
+            WriteRequest::builder()
+                .delete_request(
+                    DeleteRequest::builder()
+                        .set_key(Some(item_key))
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        );
+    }
+
+    results.insert(cx.effective_table_name(), write_requests);
+    Ok(results)
+}
+
 /* =================================================
 Private functions
 ================================================= */
