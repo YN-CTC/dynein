@@ -401,6 +401,28 @@ pub enum Sub {
         workers: usize,
     },
 
+    /// Delete ALL items in a DynamoDB table. (Scan + BatchWriteItem DeleteRequest)
+    ///
+    /// This command scans the entire table and deletes every item using parallel BatchWriteItem requests.
+    /// Use --workers to control parallelism and --wcu-percent to stay within WCU budget.
+    #[clap(verbatim_doc_comment)]
+    Purge {
+        /// Skip interactive confirmation before deleting all items.
+        #[clap(short, long, verbatim_doc_comment)]
+        yes: bool,
+
+        /// Percentage of table's WCU (Write Capacity Units) to use for purge.{n}
+        /// Only effective when the table is in Provisioned mode.{n}
+        /// Valid values are 1-100. e.g. --wcu-percent 50 uses 50% of the table's WCU.
+        #[clap(long, value_parser = clap::value_parser!(u8).range(1..=100), verbatim_doc_comment)]
+        wcu_percent: Option<u8>,
+
+        /// Number of concurrent BatchWriteItem requests to issue in parallel (default: 8).{n}
+        /// BatchWriteItem is limited to 25 items per request, so throughput = workers × 25 / RTT.
+        #[clap(long, default_value = "8", verbatim_doc_comment)]
+        workers: usize,
+    },
+
     /// Take backup of a DynamoDB table using on-demand backup
     ///
     /// For more details: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/BackupRestore.html

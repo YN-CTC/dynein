@@ -288,8 +288,6 @@ pub async fn export(
     format: Option<String>,
     rcu_percent: Option<u8>,
 ) -> Result<(), DyneinExportError> {
-    // TODO: Parallel scan to make it faster https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan
-    // TODO: Show rough progress bar (sum(scan_output.scanned_item)/item_size_of_the_table(6hr)) to track progress.
     let ts: app::TableSchema = app::table_schema(cx).await;
     let format_str: Option<&str> = format.as_deref();
 
@@ -299,7 +297,6 @@ pub async fn export(
             println!("WARN: --rcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
             None
         } else {
-            // Get the table's RCU from DescribeTable API
             let desc = control::describe_table_api(cx, ts.name.clone()).await;
             let rcu = desc
                 .provisioned_throughput
@@ -354,7 +351,6 @@ pub async fn export(
     };
 
     // Create output file. If target file already exists, ask users if it's ok to delete contents of the file.
-    // Though final output file is created here, it would be blank until scan all items. You can see progress in temporary output file.
     let f: fs::File = if Path::new(&output_file).exists() {
         let msg = "Specified output file already exists. Is it OK to truncate contents?";
         if !Confirm::new().with_prompt(msg).interact()? {
@@ -371,7 +367,6 @@ pub async fn export(
             .open(&output_file)?
     };
 
-    // These temporary file is used to store data "body" and finally merged into output file.
     let tmp_output_filename: &str = &format!("{}_tmp", output_file);
     let mut tmp_output_file: fs::File = fs::OpenOptions::new()
         .create(true)
@@ -385,14 +380,10 @@ pub async fn export(
     // before issuing the next scan. Starts at 0.0 so the very first scan is never delayed.
     let mut last_actual_rcu: f64 = 0.0;
     loop {
-        // Apply RCU-accurate rate limiting based on actual capacity consumed in the previous scan.
-        // Unlike item-count heuristics, this correctly handles variable item sizes (1 RCU = 4 KB).
         if let Some(ref mut rl) = rate_limiter {
             rl.wait_based_on_cu(last_actual_rcu).await;
         }
 
-        // Invoke Scan API here. At the 1st iteration exclusive_start_key would be "None" as defined above, outside of the loop.
-        // On 2nd iteration and later, passing last_evaluated_key from the previous loop as an exclusive_start_key.
         let scan_output: ScanOutput = data::scan_api(
             cx,
             None,  /* index */
@@ -404,8 +395,6 @@ pub async fn export(
         )
         .await;
 
-        // Capture the actual RCU consumed by this scan page for the next iteration.
-        // scan_api always requests ReturnConsumedCapacity::Total, so this is always populated.
         last_actual_rcu = scan_output
             .consumed_capacity
             .as_ref()
@@ -448,8 +437,6 @@ pub async fn export(
         }
         progress_status.show();
 
-        // update last_evaluated_key for the next iteration.
-        // If there's no more item in the table, last_evaluated_key would be "None" and it means it's ok to break the loop.
         debug!(
             "scan_output.last_evaluated_key is: {:?}",
             &scan_output.last_evaluated_key
@@ -475,7 +462,6 @@ pub async fn export(
         Some(o) => panic!("Invalid output format is given: {}", o),
     };
 
-    // As mentioned earlier, deleting temporary file here in all formats.
     fs::remove_file(tmp_output_filename)?;
 
     Ok(())
@@ -501,7 +487,6 @@ pub async fn import(
             println!("WARN: --wcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
             None
         } else {
-            // Get the table's WCU from DescribeTable API
             let desc = control::describe_table_api(cx, ts.name.clone()).await;
             let wcu = desc
                 .provisioned_throughput
@@ -553,10 +538,8 @@ pub async fn import(
             .await?;
         }
         Some("jsonl") => {
-            // JSON Lines can be deserialized with into_iter() as below.
             let array_of_json_obj: StreamDeserializer<'_, StrRead<'_>, JsonValue> =
                 Deserializer::from_str(&input_string).into_iter::<JsonValue>();
-            // list_of_jsons contains deserialize results. Filter them and get only valid items.
             let array_of_valid_json_obj: Vec<JsonValue> =
                 array_of_json_obj.filter_map(Result::ok).collect();
             write_array_of_jsons_with_chunked_25(
@@ -569,11 +552,8 @@ pub async fn import(
             .await?;
         }
         Some("csv") => {
-            // CSV import remains sequential; reuse the sequential RateLimiter for WCU control.
+            // CSV import remains sequential; use a shared client + RateLimiter for WCU control.
             let mut rate_limiter_csv: Option<RateLimiter> = token_bucket.as_ref().map(|_| {
-                // Reconstruct a sequential RateLimiter from the token_bucket's rate.
-                // We stored the target as target_ops inside the token bucket; re-derive from wcu_percent.
-                // Fallback: use a dummy that won't throttle (we'll just use wait_based_on_cu).
                 RateLimiter {
                     target_ops: 0.0, // will be overridden below
                     last_operation_time: None,
@@ -594,13 +574,14 @@ pub async fn import(
 
             let lines: Vec<&str> = input_string
                 .split('\n')
-                .collect::<Vec<&str>>() // split by "\n" and get lines
+                .collect::<Vec<&str>>()
                 .into_iter()
                 .filter(|&x| !x.is_empty())
-                .collect::<Vec<&str>>(); // remove blank line (e.g. last line)
+                .collect::<Vec<&str>>();
             let headers: Vec<&str> = lines[0].split(',').collect::<Vec<&str>>();
             let mut matrix: Vec<Vec<&str>> = vec![];
-            // Iterate over lines (from index = 1, as index = 0 is the header line)
+            // Create a single client to reuse TCP connections across all batch writes.
+            let shared_client = batch::create_batch_client(cx).await;
             let mut progress_status = ProgressState::new(MAX_NUMBER_OF_OBSERVES);
             // WCU consumed by the previous BatchWriteItem call; 0.0 on the first batch (no delay).
             let mut last_actual_wcu: f64 = 0.0;
@@ -613,7 +594,7 @@ pub async fn import(
                         rl.wait_based_on_cu(last_actual_wcu).await;
                     }
                     last_actual_wcu =
-                        write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
+                        write_csv_matrix(cx, &shared_client, &matrix, &headers, enable_set_inference).await?;
                     progress_status.add_observation(25);
                     progress_status.show();
                     matrix.clear();
@@ -624,13 +605,169 @@ pub async fn import(
                 if let Some(ref mut rl) = rate_limiter_csv {
                     rl.wait_based_on_cu(last_actual_wcu).await;
                 }
-                write_csv_matrix(cx, &matrix, &headers, enable_set_inference).await?;
+                write_csv_matrix(cx, &shared_client, &matrix, &headers, enable_set_inference).await?;
                 progress_status.add_observation(matrix.len());
                 progress_status.show();
             }
         }
         Some(o) => panic!("Invalid input format is given: {}", o),
     }
+    Ok(())
+}
+
+/// Delete ALL items in a DynamoDB table by scanning and issuing parallel BatchWriteItem DeleteRequests.
+///
+/// The scan retrieves only primary key(s) (keys_only=true) to minimise RCU.
+/// Deletions are fanned out to `workers` concurrent BatchWriteItem requests using the same
+/// shared DynamoDB client and TokenBucket pattern as `import`.
+pub async fn purge(
+    cx: &app::Context,
+    yes: bool,
+    wcu_percent: Option<u8>,
+    workers: usize,
+) -> Result<(), batch::DyneinBatchError> {
+    let ts: app::TableSchema = app::table_schema(cx).await;
+
+    // Confirm before wiping unless --yes is specified
+    if !yes {
+        let msg = format!(
+            "This will DELETE ALL items from table '{}'. Are you sure? (This cannot be undone)",
+            ts.name
+        );
+        if !Confirm::new().with_prompt(msg).interact()? {
+            println!("Operation has been cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Setup token bucket (same pattern as import)
+    let token_bucket: Option<Arc<TokioMutex<TokenBucket>>> = if let Some(percent) = wcu_percent {
+        if ts.mode == table::Mode::OnDemand {
+            println!("WARN: --wcu-percent is specified but the table is in OnDemand mode. Rate limiting will be skipped.");
+            None
+        } else {
+            let desc = control::describe_table_api(cx, ts.name.clone()).await;
+            let wcu = desc
+                .provisioned_throughput
+                .as_ref()
+                .and_then(|pt| pt.write_capacity_units)
+                .unwrap_or(0);
+            if wcu == 0 {
+                println!("WARN: Table WCU is 0. Rate limiting will be skipped.");
+                None
+            } else {
+                let target = (wcu as f64) * (percent as f64 / 100.0);
+                println!(
+                    "Rate limiting enabled: using {}% of {} WCU ({:.1} writes/sec), workers={}",
+                    percent, wcu, target, workers
+                );
+                Some(Arc::new(TokioMutex::new(TokenBucket::new(target))))
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build shared DDB client ONCE for the entire purge.
+    // All parallel workers share this client → connection pool is reused → no TLS timeout.
+    let retry_config = cx
+        .retry
+        .as_ref()
+        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
+    let sdk_config = cx
+        .effective_sdk_config_with_retry(retry_config.cloned())
+        .await;
+    let shared_ddb = Arc::new(DynamoDbSdkClient::new(&sdk_config));
+
+    let progress = Arc::new(TokioMutex::new(ProgressState::new(MAX_NUMBER_OF_OBSERVES)));
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+
+    let mut last_evaluated_key: Option<HashMap<String, AttributeValue>> = None;
+
+    loop {
+        // Scan with keys_only=true to minimise RCU consumption.
+        let scan_output = data::scan_api(
+            cx,
+            None,   /* index */
+            false,  /* consistent_read */
+            &None,  /* attributes */
+            true,   /* keys_only */
+            None,   /* limit */
+            last_evaluated_key,
+        )
+        .await;
+
+        let items = scan_output
+            .items
+            .expect("Scan result items should be 'Some' even if no item returned.");
+
+        // Fan-out deletions in chunks of 25 (BatchWriteItem limit)
+        for chunk in items.chunks(25) {
+            let chunk_vec = chunk.to_vec();
+            let count = chunk_vec.len();
+
+            // Back-pressure: wait for one in-flight batch to complete before submitting another.
+            if in_flight.len() >= workers {
+                if let Some(result) = in_flight.next().await {
+                    result?;
+                }
+            }
+
+            // Rate-limit: acquire tokens based on estimated WCU (1 token ≈ 1 WCU for ≤1KB items).
+            if let Some(ref tb) = token_bucket {
+                acquire_tokens(tb, count as f64).await;
+            }
+
+            let ddb_clone = Arc::clone(&shared_ddb);
+            let tb_clone = token_bucket.clone();
+            let prog_clone = Arc::clone(&progress);
+            let ts_clone = ts.clone();
+            let table_name = cx.effective_table_name();
+
+            in_flight.push(async move {
+                let request_items = batch::build_delete_request_items_from_attrmap(
+                    table_name,
+                    chunk_vec,
+                    &ts_clone,
+                );
+                let actual_wcu =
+                    batch::batch_write_until_processed_with_client(&ddb_clone, request_items).await?;
+                debug!(
+                    "BatchWriteItem (delete) consumed {:.1} WCU this batch (actual)",
+                    actual_wcu
+                );
+                // Reconcile actual vs estimated WCU consumption in the token bucket.
+                if let Some(ref tb) = tb_clone {
+                    let estimated = count as f64;
+                    let diff = actual_wcu - estimated;
+                    if diff > 0.0 {
+                        acquire_tokens(tb, diff).await;
+                    } else if diff < 0.0 {
+                        let mut guard = tb.lock().await;
+                        guard.tokens = (guard.tokens + (-diff)).min(guard.max_burst);
+                    }
+                }
+                {
+                    let mut prog = prog_clone.lock().await;
+                    prog.add_observation(count);
+                    prog.show();
+                }
+                Ok::<(), batch::DyneinBatchError>(())
+            });
+        }
+
+        match scan_output.last_evaluated_key {
+            None => break,
+            Some(lek) => last_evaluated_key = Some(lek),
+        }
+    }
+
+    // Drain remaining in-flight futures.
+    while let Some(result) = in_flight.next().await {
+        result?;
+    }
+
+    println!(); // newline after progress display
     Ok(())
 }
 
@@ -645,7 +782,6 @@ async fn overwrite_attributes_or_exit(
     println!("As neither --keys-only nor --attributes options are given, fetching an item to understand attributes to export...");
     let suggested_attributes: Vec<SuggestedAttribute> = suggest_attributes(cx, ts).await;
 
-    // if at least one attribute found
     println!("Found following attributes in the first item in the table:");
     for preview_attribute in &suggested_attributes {
         println!(
@@ -658,7 +794,6 @@ async fn overwrite_attributes_or_exit(
         app::bye(0, "Operation has been cancelled. You can use --keys-only or --attributes option to specify columns explicitly.");
     }
 
-    // Overwrite given attributes with suggested attributes beased on a sampled item
     Ok(Some(
         suggested_attributes
             .into_iter()
@@ -672,7 +807,6 @@ async fn overwrite_attributes_or_exit(
 async fn suggest_attributes(cx: &app::Context, ts: &app::TableSchema) -> Vec<SuggestedAttribute> {
     let mut attributes_suggestion = vec![];
 
-    // items: Vec<HashMap<String, AttributeValue>>
     let items = data::scan_api(
         cx,
         None,    /* index */
@@ -690,20 +824,17 @@ async fn suggest_attributes(cx: &app::Context, ts: &app::TableSchema) -> Vec<Sug
         app::bye(0, "No item to export in this table. Quit the operation.");
     }
 
-    // Filter out primary keys. i.e. select attributes that aren't required by the table's keyschema.
     let primary_keys = [
         Some(ts.pk.name.to_owned()),
         ts.sk.to_owned().map(|x| x.name),
     ];
     let non_key_attributes = items[0]
         .iter()
-        .filter(
-            |(attr, _)| {
-                !primary_keys
-                    .iter()
-                    .any(|key| Some(attr.to_owned()) == key.as_ref())
-            }, // ).map(|(k, _)| k).collect::<Vec<&String>>();
-        )
+        .filter(|(attr, _)| {
+            !primary_keys
+                .iter()
+                .any(|key| Some(attr.to_owned()) == key.as_ref())
+        })
         .collect::<Vec<(&String, &AttributeValue)>>();
 
     for (attr, attrval) in non_key_attributes {
@@ -729,7 +860,6 @@ fn filter_attributes_to_append(ts: &app::TableSchema, ats: &str) -> Vec<String> 
     let mut attributes_to_append: Vec<String> = vec![];
     let splitted_attributes: Vec<String> = ats.split(',').map(|x| x.trim().to_owned()).collect();
     for attr in splitted_attributes {
-        // skip if attributes contain primary key(s)
         if attr == ts.pk.name || (ts.sk.is_some() && attr == ts.sk.as_ref().unwrap().name) {
             println!("NOTE: primary keys are included by default and you don't need to give them as a part of --attributes.");
             continue;
@@ -740,14 +870,10 @@ fn filter_attributes_to_append(ts: &app::TableSchema, ats: &str) -> Vec<String> 
 }
 
 /// This function tweaks scan output items.
-/// Each scan iteration, converted string would be a single JSON array: e.g. [ {a:1}, {a:2} ]
-/// When multiple scan is needed (i.e. when last_evaluated_key is Some), connected string would be: e.g. [ {a:1}, {a:2} ][ {a:3}, {a:4} ]
-/// To avoid this invalid JSON from written to output file, this method remove the first "[" and the last "]", then add "," after the last item.
 fn connectable_json(mut s: String, compact: bool) -> String {
     s.remove(0); // remove first char "["
     let len = s.len();
     if compact || len == 1 {
-        // empty array even if not compact is on one line
         s.truncate(len - 1); // remove last char "]"
     } else {
         s.truncate(len - 2); // remove last char "]" and newline
@@ -756,10 +882,8 @@ fn connectable_json(mut s: String, compact: bool) -> String {
     s
 }
 
-/// This function takes final output file and temporary filename which has incomplete JSON body, and write final output JSON file.
-/// last "]" is not added in this function, as it depends on json or json-compact.
 fn json_finish(mut f: fs::File, tmp_output_filename: &str) -> Result<fs::File, IOError> {
-    f.write_all(b"[")?; // write initial "[" as the first letter of JSON array.
+    f.write_all(b"[")?;
     let mut contents = fs::read_to_string(tmp_output_filename)?;
     let len = contents.len();
     contents.truncate(len - 1); // remove last ","
@@ -767,14 +891,12 @@ fn json_finish(mut f: fs::File, tmp_output_filename: &str) -> Result<fs::File, I
     Ok(f)
 }
 
-/// This function takes final output file and temporary filename. For JSON"L", copying whole content is enough.
 fn jsonl_finish(mut f: fs::File, tmp_output_filename: &str) -> Result<(), IOError> {
     let contents = fs::read_to_string(tmp_output_filename)?;
     f.write_all(contents.as_bytes())?;
     Ok(())
 }
 
-/// This function takes final output file and temporary filename, writing CSV header and then copying contents to the output file.
 fn csv_finish(
     mut f: fs::File,
     tmp_output_filename: &str,
@@ -788,13 +910,11 @@ fn csv_finish(
     Ok(f)
 }
 
-/// This function generate CSV headers for the output file to export.
 fn build_csv_header(
     ts: &app::TableSchema,
     attributes_to_append: Option<Vec<String>>,
     keys_only: bool,
 ) -> String {
-    // First of all put pk (and sk, if exists)
     let mut header_str: String = ts.pk.name.clone();
     if let Some(sk) = &ts.sk {
         header_str.push(',');
@@ -906,24 +1026,18 @@ async fn write_array_of_jsons_with_chunked_25(
     Ok(())
 }
 
-/// This function takes "matrix" with "headers", builds a parameter for BatchWriteItem, then write it untill they've been processed all.
-/// The "matrix" is a data built from CSV file and each "cell/column" is an attribute of a item.
-///
-/// e.g.
-///    name, age, fruit ... headers
-/// [[John, 12, Apple],
-///  [Ami, 23, Orange],
-///  [Shu, 42, Banana]] ... matrix
-/// Writes a CSV matrix chunk via BatchWriteItem and returns the actual WCU consumed.
+/// Writes a CSV matrix chunk via BatchWriteItem using a shared pre-built client.
+/// Returns the actual WCU consumed (used by the sequential CSV rate limiter).
 async fn write_csv_matrix(
     cx: &app::Context,
+    ddb: &DynamoDbSdkClient,
     matrix: &[Vec<&str>],
     headers: &[&str],
     enable_set_inference: bool,
 ) -> Result<f64, batch::DyneinBatchError> {
     let request_items: HashMap<String, Vec<WriteRequest>> =
         batch::csv_matrix_to_request_items(cx, matrix, headers, enable_set_inference).await?;
-    let consumed_wcu = batch::batch_write_until_processed(cx, request_items).await?;
+    let consumed_wcu = batch::batch_write_until_processed_with_client(ddb, request_items).await?;
     debug!("BatchWriteItem consumed {:.1} WCU this CSV batch (actual)", consumed_wcu);
     Ok(consumed_wcu)
 }

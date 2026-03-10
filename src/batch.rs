@@ -131,28 +131,8 @@ pub fn build_batch_request_items_from_json(
         for op in ops {
             if let Some(wrapped_item /* JsonValue */) = op.get("PutRequest") {
                 debug!("Building an item for PutRequest in BatchWriteItem");
-                /*
-                  JSON syntax for PutRequest would look like:
-                    { "Thread": [
-                      { "PutRequest": {
-                        "Item": {
-                          "ForumName": { "S": "Amazon DynamoDB" },
-                          "Subject": { "S": "DynamoDB Thread 1" },
-                          "Message": { "S": "DynamoDB thread 1 message" },
-                          "LastPostedBy": { ...
-                */
                 if let Some(raw_item /* JsonValue */) = wrapped_item.get("Item") {
                     debug!("PutRequest content item is: {:#?}", &raw_item);
-                    /*
-                      PutRequest content item is:
-                        Object({
-                            "Category": Object( { "S": String( "Amazon Web Services",), },),
-                            "Messages": Object( { "N": String( "4",), },),
-                            "Name": Object( { "S": String( "Amazon DynamoDB",), },),
-                            "Threads": Object( { "N": String( "2",), },),
-                            "Views": Object( { "N": String( "1000",), },),
-                        },)
-                    */
                     let item: HashMap<String, AttributeValue> =
                         ddbjson_attributes_to_attrvals(raw_item);
                     write_requests.push(
@@ -167,27 +147,8 @@ pub fn build_batch_request_items_from_json(
                 }
             } else if let Some(wrapped_key) = op.get("DeleteRequest") {
                 debug!("Building an item for DeleteRequest in BatchWriteItem");
-                /*
-                  JSON syntax for DeleteRequest would look like:
-                    { "Thread": [
-                      { "DeleteRequest": {
-                          "Key": {
-                            "ForumName": { "S": "Amazon DynamoDB" },
-                            "Subject": { "S": "DynamoDB Thread 1" }
-                          }
-                        }
-                      },
-                */
-
                 if let Some(raw_key) = wrapped_key.get("Key") {
                     debug!("DeleteRequest target key is: {:#?}", &raw_key);
-                    /*
-                      DeleteRequest content item is:
-                        Object( {
-                          "ForumName": Object( { "S": String( "Amazon DynamoDB",), },),
-                          "Subject": Object( { "S": String( "DynamoDB Thread 1",), },),
-                        },)
-                    */
                     let key: HashMap<String, AttributeValue> =
                         ddbjson_attributes_to_attrvals(raw_key);
                     write_requests.push(
@@ -204,20 +165,27 @@ pub fn build_batch_request_items_from_json(
                 error!("[skip] In the given batch data, unknown field (neither PutRequest nor DeleteRequest) found: {:?}", op);
             }
         }
-        // finally build BatchWriteItem request items which cinsists of table name key and a vector of write requests (put/delete).
         results.insert(tbl.to_string(), write_requests);
-    } // end loop over a "table" key. will take a look at next table if any.
+    }
 
     Ok(results)
 }
 
-/// this function calls BatchWriteItem API and returns UnprocessedItems.
-/// Though the type of res.unprocessed_items is `Option`, when all items are written, `Some({})` would be returned instead of `None`.
-/// ref: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html
-/// > If any requested operations fail because the table's provisioned throughput is exceeded or an internal processing failure occurs,
-/// > the failed operations are returned in the UnprocessedItems response parameter.
-/// > You can investigate and optionally resend the requests. Typically, you would call BatchWriteItem in a loop. Each iteration would
-/// > check for unprocessed items and submit a new BatchWriteItem request with those unprocessed items until all items have been processed.
+/// Creates a `DynamoDbSdkClient` with batch-write-specific retry configuration.
+/// Use this to create a single client instance that can be reused across multiple
+/// batch write operations, which avoids creating a new TCP connection for every request
+/// and prevents ephemeral port exhaustion (TCP TIME_WAIT accumulation).
+pub async fn create_batch_client(cx: &app::Context) -> DynamoDbSdkClient {
+    let retry_config = cx
+        .retry
+        .as_ref()
+        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
+    let config = cx
+        .effective_sdk_config_with_retry(retry_config.cloned())
+        .await;
+    DynamoDbSdkClient::new(&config)
+}
+
 /// Core BatchWriteItem API call using a pre-built DynamoDB client.
 /// Returns (unprocessed_items, consumed_wcu).
 async fn do_batch_write(
@@ -247,7 +215,6 @@ async fn do_batch_write(
     }
 }
 
-/// Returns (unprocessed_items, total_consumed_wcu).
 /// Creates a new DynamoDB client from the context on every call (used by bwrite command).
 async fn batch_write_item_api(
     cx: &app::Context,
@@ -260,38 +227,12 @@ async fn batch_write_item_api(
         "Calling BatchWriteItem API with request_items: {:?}",
         &request_items
     );
-
-    let retry_config = cx
-        .retry
-        .as_ref()
-        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
-    let config = cx
-        .effective_sdk_config_with_retry(retry_config.cloned())
-        .await;
-    let ddb = DynamoDbSdkClient::new(&config);
+    let ddb = create_batch_client(cx).await;
     do_batch_write(&ddb, request_items).await
 }
 
-/// Calls BatchWriteItem in a loop until all items are processed.
-/// Returns the total WCU consumed across all retries.
-/// Creates a new DynamoDB client from the context (used by CSV import and bwrite).
-pub async fn batch_write_until_processed(
-    cx: &app::Context,
-    request_items: HashMap<String, Vec<WriteRequest>>,
-) -> Result<f64, aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>> {
-    let retry_config = cx
-        .retry
-        .as_ref()
-        .map(|v| v.batch_write_item.as_ref().unwrap_or(&v.default));
-    let config = cx
-        .effective_sdk_config_with_retry(retry_config.cloned())
-        .await;
-    let ddb = DynamoDbSdkClient::new(&config);
-    batch_write_until_processed_with_client(&ddb, request_items).await
-}
-
 /// Calls BatchWriteItem in a loop until all items are processed using a **shared** pre-built client.
-/// Use this variant for parallel import to avoid creating a new connection pool per request.
+/// Use this variant for parallel import/purge to avoid creating a new connection pool per request.
 /// Returns the total WCU consumed across all retries.
 pub async fn batch_write_until_processed_with_client(
     ddb: &DynamoDbSdkClient,
@@ -314,6 +255,17 @@ pub async fn batch_write_until_processed_with_client(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Calls BatchWriteItem in a loop until all items are processed.
+/// Creates a new DynamoDB client from the context (used by CSV import and bwrite).
+/// Returns the total WCU consumed across all retries.
+pub async fn batch_write_until_processed(
+    cx: &app::Context,
+    request_items: HashMap<String, Vec<WriteRequest>>,
+) -> Result<f64, aws_sdk_dynamodb::error::SdkError<BatchWriteItemError>> {
+    let ddb = create_batch_client(cx).await;
+    batch_write_until_processed_with_client(&ddb, request_items).await
 }
 
 /// This function is intended to be called from main.rs, as a destination of bwrite command.
@@ -392,10 +344,9 @@ pub async fn batch_write_item(
     Ok(())
 }
 
-
 /// This function takes cx (just for table name) and Vec<JsonValue>, where this JsonValue consists of multiple items as a standard JSON format,
 ///   then returns a HashMap from table name to Vec<WriteRequest>.
-///   The returned HashMap can be used for a value of "RequestItems" parameter in BatchWriteItem API. https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_BatchWriteItem.html
+///   The returned HashMap can be used for a value of "RequestItems" parameter in BatchWriteItem API.
 /// Note that this function assumes that target table is only one table.
 pub async fn convert_jsonvals_to_request_items(
     cx: &app::Context,
@@ -406,7 +357,6 @@ pub async fn convert_jsonvals_to_request_items(
     let mut write_requests = Vec::<WriteRequest>::new();
 
     for item_jsonval in items_jsonval {
-        // Focusing on an item - iterate over attributes in an item.
         let mut item = HashMap::<String, AttributeValue>::new();
         for (attr_name, body) in item_jsonval
             .as_object()
@@ -419,7 +369,6 @@ pub async fn convert_jsonvals_to_request_items(
             );
         }
 
-        // Fill meaningful put_request here, then push it to the write_requests. Then go to the next item.
         write_requests.push(
             WriteRequest::builder()
                 .put_request(PutRequest::builder().set_item(Some(item)).build().unwrap())
@@ -427,19 +376,99 @@ pub async fn convert_jsonvals_to_request_items(
         );
     }
 
-    // A single table name as a key, and insert all (up to 25) write_requests under the single table.
     results.insert(cx.effective_table_name(), write_requests);
 
     Ok(results)
 }
 
+/// Builds BatchWriteItem request items using DeleteRequest by extracting only the
+/// primary key(s) from each JSON item. All non-key attributes in the items are ignored.
+/// This mirrors `convert_jsonvals_to_request_items` but produces DeleteRequests instead of PutRequests.
+pub async fn convert_jsonvals_to_delete_request_items(
+    cx: &app::Context,
+    items_jsonval: Vec<JsonValue>,
+    ts: &app::TableSchema,
+) -> Result<HashMap<String, Vec<WriteRequest>>, DyneinBatchError> {
+    let mut results = HashMap::<String, Vec<WriteRequest>>::new();
+    let mut write_requests = Vec::<WriteRequest>::new();
+
+    for item_jsonval in items_jsonval {
+        let mut item_key = HashMap::<String, AttributeValue>::new();
+        let obj = item_jsonval
+            .as_object()
+            .expect("each item should be a valid JSON object");
+
+        // Extract PK value
+        if let Some(pk_val) = obj.get(&ts.pk.name) {
+            item_key.insert(
+                ts.pk.name.clone(),
+                data::dispatch_jsonvalue_to_attrval(pk_val, false),
+            );
+        }
+
+        // Extract SK value (if the table has a sort key)
+        if let Some(sk) = &ts.sk {
+            if let Some(sk_val) = obj.get(&sk.name) {
+                item_key.insert(
+                    sk.name.clone(),
+                    data::dispatch_jsonvalue_to_attrval(sk_val, false),
+                );
+            }
+        }
+
+        write_requests.push(
+            WriteRequest::builder()
+                .delete_request(
+                    DeleteRequest::builder()
+                        .set_key(Some(item_key))
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        );
+    }
+
+    results.insert(cx.effective_table_name(), write_requests);
+    Ok(results)
+}
+
+/// Builds BatchWriteItem DeleteRequest items directly from scan output attribute maps.
+/// Only PK (and SK if present) values are extracted; all other attributes are ignored.
+/// This is the most efficient path for the `purge` command (no JSON conversion needed).
+pub fn build_delete_request_items_from_attrmap(
+    table_name: String,
+    items: Vec<HashMap<String, AttributeValue>>,
+    ts: &app::TableSchema,
+) -> HashMap<String, Vec<WriteRequest>> {
+    let write_requests: Vec<WriteRequest> = items
+        .into_iter()
+        .map(|item| {
+            let mut key = HashMap::<String, AttributeValue>::new();
+            if let Some(pk_val) = item.get(&ts.pk.name) {
+                key.insert(ts.pk.name.clone(), pk_val.clone());
+            }
+            if let Some(sk) = &ts.sk {
+                if let Some(sk_val) = item.get(&sk.name) {
+                    key.insert(sk.name.clone(), sk_val.clone());
+                }
+            }
+            WriteRequest::builder()
+                .delete_request(
+                    DeleteRequest::builder()
+                        .set_key(Some(key))
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+        })
+        .collect();
+
+    let mut results = HashMap::new();
+    results.insert(table_name, write_requests);
+    results
+}
+
 /// "matrix" is a vector of vectors. These internal vectors has strs, each of them is an attribute for an item.
-///
-/// e.g.
-///    name, age, fruit ... headers
-/// [[John, 12, Apple],
-///  [Ami, 23, Orange],
-///  [Shu, 42, Banana]] ... matrix
 pub async fn csv_matrix_to_request_items(
     cx: &app::Context,
     matrix: &[Vec<&str>],
@@ -461,7 +490,6 @@ pub async fn csv_matrix_to_request_items(
     let mut write_requests = Vec::<WriteRequest>::new();
 
     for cells in matrix {
-        // Build an item. Note that DynamoDB data type of attributes are left to how serde_json::from_str parse the value in the cell.
         let mut item = HashMap::<String, AttributeValue>::new();
         for i in 0..headers.len() {
             let jsonval = serde_json::from_str(cells[i])?;
@@ -475,7 +503,6 @@ pub async fn csv_matrix_to_request_items(
             );
         }
 
-        // Fill meaningful put_request here, then push it to the write_requests. Then go to the next item.
         write_requests.push(
             WriteRequest::builder()
                 .put_request(PutRequest::builder().set_item(Some(item)).build().unwrap())
@@ -483,9 +510,82 @@ pub async fn csv_matrix_to_request_items(
         );
     }
 
-    // A single table name as a key, and insert all (up to 25) write_requests under the single table.
     results.insert(cx.effective_table_name(), write_requests);
 
+    Ok(results)
+}
+
+/// Builds BatchWriteItem request items using DeleteRequest from a CSV matrix.
+/// Only PK (and SK if present) columns are extracted; all other columns are ignored.
+/// `headers` must contain the PK/SK column names matching the table schema.
+pub async fn csv_matrix_to_delete_request_items(
+    cx: &app::Context,
+    matrix: &[Vec<&str>],
+    headers: &[&str],
+    ts: &app::TableSchema,
+) -> Result<HashMap<String, Vec<WriteRequest>>, DyneinBatchError> {
+    // Resolve PK column index
+    let pk_idx = headers
+        .iter()
+        .position(|h| *h == ts.pk.name)
+        .ok_or_else(|| {
+            DyneinBatchError::InvalidInput(format!(
+                "PK '{}' not found in CSV headers",
+                ts.pk.name
+            ))
+        })?;
+
+    // Resolve SK column index (optional)
+    let sk_idx: Option<(usize, String)> = ts
+        .sk
+        .as_ref()
+        .map(|sk| {
+            headers
+                .iter()
+                .position(|h| *h == sk.name)
+                .map(|idx| (idx, sk.name.clone()))
+                .ok_or_else(|| {
+                    DyneinBatchError::InvalidInput(format!(
+                        "SK '{}' not found in CSV headers",
+                        sk.name
+                    ))
+                })
+        })
+        .transpose()?;
+
+    let mut results = HashMap::<String, Vec<WriteRequest>>::new();
+    let mut write_requests = Vec::<WriteRequest>::new();
+
+    for cells in matrix {
+        let mut item_key = HashMap::<String, AttributeValue>::new();
+
+        let pk_jsonval: serde_json::Value = serde_json::from_str(cells[pk_idx])?;
+        item_key.insert(
+            ts.pk.name.clone(),
+            data::dispatch_jsonvalue_to_attrval(&pk_jsonval, false),
+        );
+
+        if let Some((sk_col_idx, ref sk_name)) = sk_idx {
+            let sk_jsonval: serde_json::Value = serde_json::from_str(cells[sk_col_idx])?;
+            item_key.insert(
+                sk_name.clone(),
+                data::dispatch_jsonvalue_to_attrval(&sk_jsonval, false),
+            );
+        }
+
+        write_requests.push(
+            WriteRequest::builder()
+                .delete_request(
+                    DeleteRequest::builder()
+                        .set_key(Some(item_key))
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        );
+    }
+
+    results.insert(cx.effective_table_name(), write_requests);
     Ok(results)
 }
 
@@ -494,15 +594,6 @@ Private functions
 ================================================= */
 
 /// As input is DynamoDB JSON, all JsonValue would be 'Object', 'String', or maybe document types.
-/// Input format (DynamoDB JSON) is where this function differs from `dispatch_jsonvalue_to_attrval`, which accepts from 'standard' human readable JSON.
-/// Input example:
-///     Object({
-///         "Category": Object( { "S": String( "Amazon Web Services",), },),
-///         "Messages": Object( { "N": String( "4",), },),
-///         "Name": Object( { "S": String( "Amazon DynamoDB",), },),
-///         "Threads": Object( { "N": String( "2",), },),
-///         "Views": Object( { "N": String( "1000",), },),
-///     },)
 fn ddbjson_attributes_to_attrvals(
     ddbjson_attributes: &JsonValue,
 ) -> HashMap<String, AttributeValue> {
@@ -529,28 +620,7 @@ fn ddbjson_attributes_to_attrvals(
     built_attributes
 }
 
-/// Input is a single attribute value (i.e. a String attribute) in DynamoDB JSON format.
-/// Input example (N):
-///     Object( { "N": String( "4",), },)
-///
-/// Input example (L):
-///     Array([
-///         Object({"S": String("Red")}),
-///         Object({"S": String("Black")})])
-///
-/// Input example (M):
-///     Object({"M": Object({
-///              "Name": Object({"S": String("Joe")})})}),
-///              "Age": Object({"N": String("35")}),
-///              "Misc": Object({
-///                  "M": Object({
-///                      "hope": Object({"BOOL": Bool(true)})})}),
-///                      "dream": Object({
-///                          "L": Array([
-///                              Object({"N": String("35")}),
-///                              Object({"NULL": Bool(true)})])}),
 fn ddbjson_val_to_attrval(ddb_jsonval: &JsonValue) -> Option<AttributeValue> {
-    // prepare shared logic that can be used for both SS and NS.
     let set_logic = |val: &JsonValue| -> Vec<String> {
         val.as_array()
             .expect("should be valid JSON array")
@@ -559,7 +629,6 @@ fn ddbjson_val_to_attrval(ddb_jsonval: &JsonValue) -> Option<AttributeValue> {
             .collect::<Vec<String>>()
     };
 
-    // following list of if-else statements would be return value of this function.
     if let Some(x) = ddb_jsonval.get("S") {
         Some(AttributeValue::S(x.as_str().unwrap().to_string()))
     } else if let Some(x) = ddb_jsonval.get("N") {
@@ -603,7 +672,6 @@ fn ddbjson_val_to_attrval(ddb_jsonval: &JsonValue) -> Option<AttributeValue> {
     }
 }
 
-//  Decodes a base64 encoded binary value to Bytes.
 fn json_binary_val_to_bytes(v: &JsonValue) -> Bytes {
     Bytes::from(
         general_purpose::STANDARD
@@ -612,7 +680,6 @@ fn json_binary_val_to_bytes(v: &JsonValue) -> Bytes {
     )
 }
 
-// Check if the item has a partition key and sort key.
 fn validate_item_keys(
     attrs: &HashMap<String, AttributeValue>,
     ts: &app::TableSchema,
@@ -675,4 +742,136 @@ fn generate_type_mismatch_error_message(attr_name: &str, expected_type: &str) ->
         "type mismatch for the key {}, expected: {}",
         attr_name, expected_type
     )
+}
+
+/* =================================================
+Unit Tests
+================================================= */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_batch_request_items_put_request() {
+        let json = r#"{"TestTable": [{"PutRequest": {"Item": {"pk": {"S": "key1"}, "val": {"N": "123"}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("TestTable"));
+        let requests = &result["TestTable"];
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].put_request().is_some());
+        let item = requests[0].put_request().unwrap().item();
+        assert_eq!(item.get("pk").unwrap(), &AttributeValue::S("key1".to_string()));
+        assert_eq!(item.get("val").unwrap(), &AttributeValue::N("123".to_string()));
+    }
+
+    #[test]
+    fn test_build_batch_request_items_delete_request() {
+        let json = r#"{"TestTable": [{"DeleteRequest": {"Key": {"pk": {"S": "key1"}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("TestTable"));
+        let requests = &result["TestTable"];
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].delete_request().is_some());
+        let key = requests[0].delete_request().unwrap().key();
+        assert_eq!(key.get("pk").unwrap(), &AttributeValue::S("key1".to_string()));
+    }
+
+    #[test]
+    fn test_build_batch_request_items_mixed_operations() {
+        let json = r#"{"TestTable": [
+            {"PutRequest":    {"Item": {"pk": {"S": "key1"}}}},
+            {"PutRequest":    {"Item": {"pk": {"S": "key2"}}}},
+            {"DeleteRequest": {"Key":  {"pk": {"S": "key3"}}}}
+        ]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("TestTable"));
+        assert_eq!(result["TestTable"].len(), 3);
+        assert!(result["TestTable"][0].put_request().is_some());
+        assert!(result["TestTable"][1].put_request().is_some());
+        assert!(result["TestTable"][2].delete_request().is_some());
+    }
+
+    #[test]
+    fn test_build_batch_request_items_multiple_tables() {
+        let json = r#"{
+            "Table1": [{"PutRequest": {"Item": {"pk": {"S": "key1"}}}}],
+            "Table2": [{"PutRequest": {"Item": {"pk": {"S": "key2"}}}}]
+        }"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+
+        assert!(result.contains_key("Table1"));
+        assert!(result.contains_key("Table2"));
+        assert_eq!(result["Table1"].len(), 1);
+        assert_eq!(result["Table2"].len(), 1);
+    }
+
+    #[test]
+    fn test_build_batch_request_items_invalid_json() {
+        let result = build_batch_request_items_from_json("invalid json".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_batch_request_items_all_scalar_types() {
+        let json = r#"{"TestTable": [{"PutRequest": {"Item": {
+            "s":    {"S":    "hello"},
+            "n":    {"N":    "42"},
+            "bool": {"BOOL": true},
+            "null": {"NULL": true},
+            "ss":   {"SS":   ["a", "b"]},
+            "ns":   {"NS":   ["1", "2"]}
+        }}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        let item = result["TestTable"][0].put_request().unwrap().item();
+
+        assert_eq!(item.get("s").unwrap(),    &AttributeValue::S("hello".to_string()));
+        assert_eq!(item.get("n").unwrap(),    &AttributeValue::N("42".to_string()));
+        assert_eq!(item.get("bool").unwrap(), &AttributeValue::Bool(true));
+        assert_eq!(item.get("null").unwrap(), &AttributeValue::Null(true));
+        assert_eq!(
+            item.get("ss").unwrap(),
+            &AttributeValue::Ss(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            item.get("ns").unwrap(),
+            &AttributeValue::Ns(vec!["1".to_string(), "2".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_build_batch_request_items_list_type() {
+        let json = r#"{"T": [{"PutRequest": {"Item": {"l": {"L": [{"S": "item1"}, {"N": "99"}]}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        let item = result["T"][0].put_request().unwrap().item();
+
+        assert_eq!(
+            item.get("l").unwrap(),
+            &AttributeValue::L(vec![
+                AttributeValue::S("item1".to_string()),
+                AttributeValue::N("99".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_build_batch_request_items_map_type() {
+        let json = r#"{"T": [{"PutRequest": {"Item": {"m": {"M": {"inner": {"S": "val"}}}}}}]}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        let item = result["T"][0].put_request().unwrap().item();
+
+        let expected_map = HashMap::from([("inner".to_string(), AttributeValue::S("val".to_string()))]);
+        assert_eq!(item.get("m").unwrap(), &AttributeValue::M(expected_map));
+    }
+
+    #[test]
+    fn test_build_batch_request_items_empty_table() {
+        let json = r#"{"TestTable": []}"#;
+        let result = build_batch_request_items_from_json(json.to_string()).unwrap();
+        assert!(result.contains_key("TestTable"));
+        assert_eq!(result["TestTable"].len(), 0);
+    }
 }
